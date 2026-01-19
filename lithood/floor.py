@@ -6,7 +6,7 @@ from decimal import Decimal
 from lithood.client import LighterClient
 from lithood.state import StateManager
 from lithood.types import OrderSide, MarketType
-from lithood.config import FLOOR_CONFIG
+from lithood.config import FLOOR_CONFIG, ALLOCATION
 from lithood.logger import log
 
 
@@ -34,6 +34,7 @@ class FloorProtection:
             if current_price <= tier["price"] and tier_triggered < tier_num:
                 await self._execute_tier(tier_num, tier, current_price)
                 self.state.set("floor_tier_triggered", tier_num)
+                break  # Execute only one tier per check cycle
 
         # Emergency check
         if portfolio_value <= self.config["emergency_buffer"]:
@@ -44,7 +45,9 @@ class FloorProtection:
         account = await self.client.get_account()
 
         # LIT value (track in state as string for Decimal precision)
-        lit_balance_str = self.state.get("lit_balance", "17175")
+        # Get default from allocation config
+        default_lit = ALLOCATION["core_lit"] + ALLOCATION["grid_sell_lit"] + ALLOCATION["reserve_lit"]
+        lit_balance_str = self.state.get("lit_balance", str(default_lit))
         lit_balance = Decimal(str(lit_balance_str))
         lit_value = lit_balance * price
 
@@ -52,6 +55,8 @@ class FloorProtection:
         usdc_balance = Decimal("0")
         if account is not None:
             usdc_balance = account.available_balance
+        else:
+            log.warning("Could not get account - using 0 for USDC balance")
 
         # Hedge PnL
         hedge_pnl = Decimal("0")
@@ -90,8 +95,8 @@ class FloorProtection:
         elif action == "emergency_exit":
             await self._emergency_exit(price, Decimal("0"))
 
-    async def _market_sell_lit(self, amount: Decimal, bucket: str):
-        """Market sell LIT from a specific bucket."""
+    async def _market_sell_lit(self, amount: Decimal, bucket: str) -> bool:
+        """Market sell LIT from a specific bucket. Returns True if successful."""
         log.warning(f"Selling {amount} LIT from {bucket} bucket")
 
         order = await self.client.place_market_order(
@@ -103,15 +108,18 @@ class FloorProtection:
 
         if order is None:
             log.error(f"Failed to sell {amount} LIT from {bucket} bucket")
-            return
+            return False
 
         # Update LIT balance tracking (store as string for Decimal precision)
-        lit_balance_str = self.state.get("lit_balance", "17175")
+        # Get default from allocation config
+        default_lit = ALLOCATION["core_lit"] + ALLOCATION["grid_sell_lit"] + ALLOCATION["reserve_lit"]
+        lit_balance_str = self.state.get("lit_balance", str(default_lit))
         lit_balance = Decimal(str(lit_balance_str))
         lit_balance -= amount
         self.state.set("lit_balance", str(lit_balance))
 
         log.warning(f"Sold {amount} LIT. New balance: {lit_balance}")
+        return True
 
     async def _emergency_exit(self, price: Decimal, portfolio_value: Decimal):
         """Emergency exit - sell everything to guarantee $25k."""
@@ -130,10 +138,14 @@ class FloorProtection:
         await self.client.cancel_all_orders()
 
         # Sell all LIT
-        lit_balance_str = self.state.get("lit_balance", "0")
+        # Get default from allocation config
+        default_lit = ALLOCATION["core_lit"] + ALLOCATION["grid_sell_lit"] + ALLOCATION["reserve_lit"]
+        lit_balance_str = self.state.get("lit_balance", str(default_lit))
         lit_balance = Decimal(str(lit_balance_str))
         if lit_balance > 0:
-            await self._market_sell_lit(lit_balance, "emergency")
+            success = await self._market_sell_lit(lit_balance, "emergency")
+            if not success:
+                log.error("CRITICAL: Emergency liquidation FAILED - manual intervention required!")
 
         # Halt bot
         self.state.set("bot_halted", True)
