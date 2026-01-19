@@ -32,6 +32,7 @@ class LitGridBot:
         self.hedge: HedgeManager = None
         self.floor: FloorProtection = None
         self._running = False
+        self._stopped = False
 
     async def start(self):
         """Initialize and start the bot."""
@@ -72,13 +73,16 @@ class LitGridBot:
             log.warning("Could not retrieve account information")
 
         # Check for existing positions
-        positions = await self.client.get_positions()
-        for p in positions:
-            if p.size < 0:
-                log.info(f"Found existing short: {p.size} LIT @ ${p.entry_price}")
-                self.state.set("hedge_active", True)
-                self.state.set("hedge_entry_price", str(p.entry_price))
-                self.state.set("hedge_size", str(abs(p.size)))
+        try:
+            positions = await self.client.get_positions()
+            for p in positions:
+                if p.size < 0:
+                    log.info(f"Found existing short: {p.size} LIT @ ${p.entry_price}")
+                    self.state.set("hedge_active", True)
+                    self.state.set("hedge_entry_price", str(p.entry_price))
+                    self.state.set("hedge_size", str(abs(p.size)))
+        except Exception as e:
+            log.error(f"Failed to sync positions: {e}")
 
         # Check for existing orders
         orders = await self.client.get_active_orders()
@@ -148,15 +152,23 @@ class LitGridBot:
                  f"paused={grid_paused}")
         log.info(f"  Hedge: active={hedge_active}, "
                  f"${total_pnl:.2f} PnL")
-        log.info(f"  Floor: tier {floor_stats['tier_triggered']}")
+        log.info(f"  Floor: tier {floor_stats.get('tier_triggered', 0)}")
         log.info("-" * 40)
 
     async def stop(self):
         """Stop the bot gracefully."""
+        if self._stopped:
+            return
+        self._stopped = True
+
         log.info("Stopping bot...")
         self._running = False
-        await self.client.close()
-        self.state.close()
+        try:
+            if self.client:
+                await self.client.close()
+        finally:
+            if self.state:
+                self.state.close()
         log.info("Bot stopped")
 
 
@@ -164,7 +176,7 @@ async def main():
     bot = LitGridBot()
 
     # Handle shutdown signals
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.stop()))
 
