@@ -290,11 +290,12 @@ class LighterClient:
         }
         return status_map.get(status.lower(), OrderStatus.PENDING)
 
-    async def get_mid_price(self, market_id: int) -> Optional[Decimal]:
+    async def get_mid_price(self, symbol: str, market_type: MarketType) -> Optional[Decimal]:
         """Get mid price from orderbook.
 
         Args:
-            market_id: Market ID
+            symbol: Market symbol (e.g., "LIT")
+            market_type: Market type (SPOT or PERP)
 
         Returns:
             Mid price or None if orderbook empty
@@ -302,9 +303,14 @@ class LighterClient:
         if not self.order_api:
             return None
 
+        market = self.get_market(symbol, market_type)
+        if not market:
+            log.error(f"Market not found: {symbol}_{market_type.value}")
+            return None
+
         try:
             result = await self.order_api.order_book_orders(
-                market_id=market_id,
+                market_id=market.market_id,
                 limit=1,
             )
 
@@ -316,7 +322,7 @@ class LighterClient:
             return (best_bid + best_ask) / 2
 
         except Exception as e:
-            log.error(f"Failed to get mid price for market {market_id}: {e}")
+            log.error(f"Failed to get mid price for market {symbol}_{market_type.value}: {e}")
             return None
 
     def _to_price_int(self, price: Decimal, market: Market) -> int:
@@ -345,24 +351,22 @@ class LighterClient:
 
     async def place_limit_order(
         self,
-        market: Market,
+        symbol: str,
+        market_type: MarketType,
         side: OrderSide,
         price: Decimal,
         size: Decimal,
-        time_in_force: TimeInForce = TimeInForce.GTC,
-        reduce_only: bool = False,
-        client_order_id: int = 0,
+        post_only: bool = True,
     ) -> Optional[str]:
         """Place a limit order.
 
         Args:
-            market: Market to trade
+            symbol: Market symbol (e.g., "LIT")
+            market_type: Market type (SPOT or PERP)
             side: BUY or SELL
             price: Order price
             size: Order size in base asset
-            time_in_force: Order time in force
-            reduce_only: Whether order is reduce-only
-            client_order_id: Optional client order ID
+            post_only: If True, use POST_ONLY time in force (default True)
 
         Returns:
             Order ID if successful, None otherwise
@@ -371,28 +375,31 @@ class LighterClient:
             log.error("Signer client not initialized")
             return None
 
+        market = self.get_market(symbol, market_type)
+        if not market:
+            log.error(f"Market not found: {symbol}_{market_type.value}")
+            return None
+
         try:
             is_ask = 1 if side == OrderSide.SELL else 0
             price_int = self._to_price_int(price, market)
             size_int = self._to_size_int(size, market)
 
-            # Map time in force
-            tif_map = {
-                TimeInForce.IOC: SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                TimeInForce.GTC: SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                TimeInForce.POST_ONLY: SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY,
-            }
-            tif = tif_map[time_in_force]
+            # Map post_only to time in force
+            if post_only:
+                tif = SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY
+            else:
+                tif = SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
 
             tx, resp, error = await self.signer_client.create_order(
                 market_index=market.market_id,
-                client_order_index=client_order_id,
+                client_order_index=0,
                 base_amount=size_int,
                 price=price_int,
                 is_ask=is_ask,
                 order_type=SignerClient.ORDER_TYPE_LIMIT,
                 time_in_force=tif,
-                reduce_only=reduce_only,
+                reduce_only=False,
             )
 
             if error:
@@ -414,22 +421,18 @@ class LighterClient:
 
     async def place_market_order(
         self,
-        market: Market,
+        symbol: str,
+        market_type: MarketType,
         side: OrderSide,
         size: Decimal,
-        max_slippage_price: Optional[Decimal] = None,
-        reduce_only: bool = False,
-        client_order_id: int = 0,
     ) -> Optional[str]:
         """Place a market order.
 
         Args:
-            market: Market to trade
+            symbol: Market symbol (e.g., "LIT")
+            market_type: Market type (SPOT or PERP)
             side: BUY or SELL
             size: Order size in base asset
-            max_slippage_price: Max acceptable price (for slippage control)
-            reduce_only: Whether order is reduce-only
-            client_order_id: Optional client order ID
 
         Returns:
             Order ID if successful, None otherwise
@@ -438,35 +441,37 @@ class LighterClient:
             log.error("Signer client not initialized")
             return None
 
+        market = self.get_market(symbol, market_type)
+        if not market:
+            log.error(f"Market not found: {symbol}_{market_type.value}")
+            return None
+
         try:
             is_ask = 1 if side == OrderSide.SELL else 0
             size_int = self._to_size_int(size, market)
 
             # Get current price for avg_execution_price
-            mid_price = await self.get_mid_price(market.market_id)
+            mid_price = await self.get_mid_price(symbol, market_type)
             if not mid_price:
                 log.error("Cannot place market order: no mid price available")
                 return None
 
-            # Use max_slippage_price if provided, otherwise use mid price with 1% slippage
-            if max_slippage_price:
-                avg_price = max_slippage_price
+            # Use mid price with 1% slippage
+            slippage = Decimal("0.01")
+            if side == OrderSide.BUY:
+                avg_price = mid_price * (1 + slippage)
             else:
-                slippage = Decimal("0.01")
-                if side == OrderSide.BUY:
-                    avg_price = mid_price * (1 + slippage)
-                else:
-                    avg_price = mid_price * (1 - slippage)
+                avg_price = mid_price * (1 - slippage)
 
             price_int = self._to_price_int(avg_price, market)
 
             tx, resp, error = await self.signer_client.create_market_order(
                 market_index=market.market_id,
-                client_order_index=client_order_id,
+                client_order_index=0,
                 base_amount=size_int,
                 avg_execution_price=price_int,
                 is_ask=is_ask,
-                reduce_only=reduce_only,
+                reduce_only=False,
             )
 
             if error:
@@ -488,14 +493,12 @@ class LighterClient:
 
     async def cancel_order(
         self,
-        market: Market,
-        order_index: int,
+        order_id: str,
     ) -> bool:
         """Cancel an order.
 
         Args:
-            market: Market the order is on
-            order_index: Index of the order to cancel
+            order_id: Order ID string to cancel
 
         Returns:
             True if successful, False otherwise
@@ -505,8 +508,17 @@ class LighterClient:
             return False
 
         try:
+            order_index = int(order_id)
+
+            # Find the order in active orders to get its market_id
+            active_orders = await self.get_active_orders()
+            order = next((o for o in active_orders if o.id == order_id), None)
+            if not order:
+                log.error(f"Order not found: {order_id}")
+                return False
+
             tx, resp, error = await self.signer_client.cancel_order(
-                market_index=market.market_id,
+                market_index=order.market_id,
                 order_index=order_index,
             )
 
@@ -514,7 +526,7 @@ class LighterClient:
                 log.error(f"Failed to cancel order: {error}")
                 return False
 
-            log.info(f"Cancelled order {order_index} on {market.symbol}")
+            log.info(f"Cancelled order {order_id}")
             return True
 
         except Exception as e:
@@ -523,12 +535,12 @@ class LighterClient:
 
     async def cancel_all_orders(
         self,
-        market: Optional[Market] = None,
+        market_id: Optional[int] = None,
     ) -> bool:
         """Cancel all orders, optionally for a specific market.
 
         Args:
-            market: Optional market to cancel orders on (cancels all if None)
+            market_id: Optional market ID to filter by (cancels all if None)
 
         Returns:
             True if successful, False otherwise
@@ -541,6 +553,24 @@ class LighterClient:
             import time
             timestamp_ms = int(time.time() * 1000)
 
+            # If market_id specified, cancel only orders for that market
+            if market_id is not None:
+                active_orders = await self.get_active_orders(market_id=market_id)
+                success = True
+                for order in active_orders:
+                    order_index = int(order.id)
+                    tx, resp, error = await self.signer_client.cancel_order(
+                        market_index=market_id,
+                        order_index=order_index,
+                    )
+                    if error:
+                        log.error(f"Failed to cancel order {order.id}: {error}")
+                        success = False
+                if success:
+                    log.info(f"Cancelled all orders for market {market_id}")
+                return success
+
+            # Cancel all orders across all markets
             tx, resp, error = await self.signer_client.cancel_all_orders(
                 time_in_force=SignerClient.CANCEL_ALL_TIF_IMMEDIATE,
                 timestamp_ms=timestamp_ms,
@@ -557,11 +587,11 @@ class LighterClient:
             log.error(f"Failed to cancel all orders: {e}")
             return False
 
-    async def get_funding_rate(self, market_id: int) -> Optional[FundingRate]:
+    async def get_funding_rate(self, symbol: str) -> Optional[FundingRate]:
         """Get current funding rate for a perp market.
 
         Args:
-            market_id: Perp market ID
+            symbol: Market symbol (e.g., "LIT")
 
         Returns:
             FundingRate or None if not found
@@ -569,11 +599,16 @@ class LighterClient:
         if not self.funding_api:
             return None
 
+        market = self.get_market(symbol, MarketType.PERP)
+        if not market:
+            log.error(f"Perp market not found: {symbol}")
+            return None
+
         try:
             result = await self.funding_api.funding_rates()
 
             for fr in result.funding_rates:
-                if fr.market_id == market_id:
+                if fr.market_id == market.market_id:
                     return FundingRate(
                         market_id=fr.market_id,
                         rate=Decimal(str(fr.rate)),
@@ -583,7 +618,7 @@ class LighterClient:
             return None
 
         except Exception as e:
-            log.error(f"Failed to get funding rate for market {market_id}: {e}")
+            log.error(f"Failed to get funding rate for {symbol}: {e}")
             return None
 
     async def get_positions(self) -> list[Position]:
