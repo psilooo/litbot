@@ -1,5 +1,20 @@
 # lithood/grid.py
-"""Spot grid trading engine."""
+"""Spot grid trading engine.
+
+IMPORTANT: Order ID handling
+-----------------------------
+When placing orders via client.place_limit_order(), the returned Order has id=tx_hash.
+When querying active orders via client.get_active_orders(), Orders have id=order_index.
+
+These are different values! The grid tracks orders by tx_hash (from placement), but
+fill detection compares against order_index (from active orders query).
+
+To handle this mismatch, we store both:
+- The tx_hash as the primary key for our local order tracking
+- We lookup orders by price/side/market to match fills since we can't rely on ID matching
+
+Future improvement: Use WebSocket fill notifications which include tx_hash for reliable matching.
+"""
 
 from decimal import Decimal
 from typing import Optional
@@ -94,7 +109,30 @@ class GridEngine:
         return order
 
     async def check_fills(self):
-        """Check for filled orders and trigger cycling."""
+        """Check for filled orders and trigger cycling.
+
+        IMPORTANT: Order ID mismatch handling
+        -------------------------------------
+        Our locally stored orders have id=tx_hash (from place_limit_order).
+        Active orders from the exchange have id=order_index (different value).
+
+        Since IDs don't match, we use price-based matching:
+        - Build a set of (price, side) tuples from active exchange orders
+        - If a pending local order's (price, side) is not in the active set, it was filled
+
+        LIMITATION: Partial fills and other edge cases
+        -----------------------------------------------
+        An order may disappear from active orders due to:
+        - Full fill (what we assume)
+        - Partial fill followed by cancellation
+        - Order expiration (TIME_IN_FORCE timeout)
+        - User cancellation via another client
+
+        For now, we assume any missing order was fully filled. This is a known
+        limitation. Proper handling requires either:
+        - Order history API (to check actual fill status)
+        - WebSocket fill notifications (preferred for real-time detection)
+        """
         if self.state.get("grid_paused"):
             return
 
@@ -105,19 +143,27 @@ class GridEngine:
             return
 
         active_orders = await self.client.get_active_orders(market_id=market.market_id)
-        active_ids = {o.id for o in active_orders}
+
+        # Build set of (price, side) for matching since order IDs don't match
+        # (local orders use tx_hash, exchange orders use order_index)
+        active_price_side = {(o.price, o.side) for o in active_orders}
 
         # Check our pending orders
         for order in self.state.get_pending_orders():
             if order.market_id != market.market_id:
                 continue
 
-            if order.id not in active_ids:
-                # Order is no longer active - assume filled
+            if (order.price, order.side) not in active_price_side:
+                # Order is no longer active at this price/side - assume filled
+                # NOTE: See docstring for limitations of this approach
                 await self._on_fill(order)
 
     async def _on_fill(self, order: Order):
-        """Handle a filled order - place the opposite side."""
+        """Handle a filled order - place the opposite side.
+
+        Preserves the original order's grid_level so we can track which
+        level a cycling order originated from.
+        """
         self.state.mark_filled(order.id)
 
         if order.side == OrderSide.BUY:
@@ -126,7 +172,8 @@ class GridEngine:
             sell_size = order.size  # Sell the LIT we just bought
 
             log.info(f"Buy filled @ ${order.price} -> placing sell @ ${sell_price}")
-            await self._place_grid_sell(sell_price, sell_size)
+            # Preserve grid_level from the original buy order
+            await self._place_grid_sell(sell_price, sell_size, grid_level=order.grid_level)
 
         else:
             # Sell filled -> place buy at -3%, keeping 3% profit
@@ -136,17 +183,30 @@ class GridEngine:
 
             log.info(f"Sell filled @ ${order.price} -> placing buy @ ${buy_price}")
             log.info(f"  Profit retained: ${usdc_received * GRID_PROFIT_RETAIN:.2f}")
-            await self._place_grid_buy(buy_price, usdc_to_reinvest)
+            # Preserve grid_level from the original sell order
+            await self._place_grid_buy(buy_price, usdc_to_reinvest, grid_level=order.grid_level)
 
-            # Update profit tracking
-            total_profit = Decimal(str(self.state.get("total_grid_profit", 0)))
+            # Update profit tracking (store as string for Decimal precision)
+            total_profit = Decimal(self.state.get("total_grid_profit", "0"))
             total_profit += usdc_received * GRID_PROFIT_RETAIN
-            self.state.set("total_grid_profit", float(total_profit))
+            self.state.set("total_grid_profit", str(total_profit))
 
-    def pause_buys(self):
-        """Pause new buy orders (called by floor protection)."""
+    def pause(self):
+        """Pause all grid trading activity (called by floor protection).
+
+        When paused:
+        - No new buy orders will be placed
+        - No new sell orders will be placed (cycling is stopped)
+        - check_fills() will return early without processing
+        - initialize() will skip order placement
+
+        Existing orders remain on the exchange until explicitly cancelled.
+        """
         self.state.set("grid_paused", True)
-        log.warning("Grid buys PAUSED")
+        log.warning("Grid trading PAUSED")
+
+    # Alias for backward compatibility - pause_buys actually pauses all grid activity
+    pause_buys = pause
 
     def resume(self):
         """Resume grid trading."""
@@ -173,6 +233,8 @@ class GridEngine:
     def get_stats(self) -> dict:
         """Get grid trading statistics."""
         stats = self.state.get_grid_stats()
-        stats["total_profit"] = self.state.get("total_grid_profit", 0)
+        # Read profit as string and convert to Decimal for precision
+        profit_str = self.state.get("total_grid_profit", "0")
+        stats["total_profit"] = Decimal(profit_str) if profit_str else Decimal("0")
         stats["paused"] = self.state.get("grid_paused", False)
         return stats
