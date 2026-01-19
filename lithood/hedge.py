@@ -108,7 +108,8 @@ class HedgeManager:
         positions = await self.client.get_positions()
         perp_pos = self._find_position(positions)
         if perp_pos and perp_pos.size != 0:
-            log.warning(f"Position still exists after close: {perp_pos.size}")
+            log.error(f"Position still exists after close attempt: {perp_pos.size} - state not updated")
+            return  # Don't update state if close failed
 
         # Calculate PnL
         current_price = await self.client.get_mid_price(self.symbol, MarketType.PERP)
