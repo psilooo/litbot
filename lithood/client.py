@@ -357,7 +357,7 @@ class LighterClient:
         price: Decimal,
         size: Decimal,
         post_only: bool = True,
-    ) -> Optional[str]:
+    ) -> Optional[Order]:
         """Place a limit order.
 
         Args:
@@ -369,7 +369,7 @@ class LighterClient:
             post_only: If True, use POST_ONLY time in force (default True)
 
         Returns:
-            Order ID if successful, None otherwise
+            Order object if successful, None otherwise
         """
         if not self.signer_client:
             log.error("Signer client not initialized")
@@ -411,7 +411,17 @@ class LighterClient:
                     f"Placed {side.value} limit order: {size} @ {price} "
                     f"(market={market.symbol}, tx={resp.tx_hash})"
                 )
-                return resp.tx_hash
+                return Order(
+                    id=resp.tx_hash,
+                    market_id=market.market_id,
+                    side=side,
+                    price=price,
+                    size=size,
+                    status=OrderStatus.PENDING,
+                    order_type=OrderType.LIMIT,
+                    created_at=datetime.now(),
+                    filled_size=Decimal("0"),
+                )
 
             return None
 
@@ -425,7 +435,7 @@ class LighterClient:
         market_type: MarketType,
         side: OrderSide,
         size: Decimal,
-    ) -> Optional[str]:
+    ) -> Optional[Order]:
         """Place a market order.
 
         Args:
@@ -435,7 +445,7 @@ class LighterClient:
             size: Order size in base asset
 
         Returns:
-            Order ID if successful, None otherwise
+            Order object if successful, None otherwise
         """
         if not self.signer_client:
             log.error("Signer client not initialized")
@@ -483,7 +493,17 @@ class LighterClient:
                     f"Placed {side.value} market order: {size} "
                     f"(market={market.symbol}, tx={resp.tx_hash})"
                 )
-                return resp.tx_hash
+                return Order(
+                    id=resp.tx_hash,
+                    market_id=market.market_id,
+                    side=side,
+                    price=avg_price,
+                    size=size,
+                    status=OrderStatus.FILLED,
+                    order_type=OrderType.MARKET,
+                    created_at=datetime.now(),
+                    filled_size=size,
+                )
 
             return None
 
@@ -536,18 +556,18 @@ class LighterClient:
     async def cancel_all_orders(
         self,
         market_id: Optional[int] = None,
-    ) -> bool:
+    ) -> int:
         """Cancel all orders, optionally for a specific market.
 
         Args:
             market_id: Optional market ID to filter by (cancels all if None)
 
         Returns:
-            True if successful, False otherwise
+            Number of orders cancelled
         """
         if not self.signer_client:
             log.error("Signer client not initialized")
-            return False
+            return 0
 
         try:
             import time
@@ -556,7 +576,7 @@ class LighterClient:
             # If market_id specified, cancel only orders for that market
             if market_id is not None:
                 active_orders = await self.get_active_orders(market_id=market_id)
-                success = True
+                cancelled_count = 0
                 for order in active_orders:
                     order_index = int(order.id)
                     tx, resp, error = await self.signer_client.cancel_order(
@@ -565,10 +585,14 @@ class LighterClient:
                     )
                     if error:
                         log.error(f"Failed to cancel order {order.id}: {error}")
-                        success = False
-                if success:
-                    log.info(f"Cancelled all orders for market {market_id}")
-                return success
+                    else:
+                        cancelled_count += 1
+                log.info(f"Cancelled {cancelled_count} orders for market {market_id}")
+                return cancelled_count
+
+            # Get count of active orders before cancelling
+            active_orders = await self.get_active_orders()
+            order_count = len(active_orders)
 
             # Cancel all orders across all markets
             tx, resp, error = await self.signer_client.cancel_all_orders(
@@ -578,14 +602,14 @@ class LighterClient:
 
             if error:
                 log.error(f"Failed to cancel all orders: {error}")
-                return False
+                return 0
 
-            log.info("Cancelled all orders")
-            return True
+            log.info(f"Cancelled {order_count} orders")
+            return order_count
 
         except Exception as e:
             log.error(f"Failed to cancel all orders: {e}")
-            return False
+            return 0
 
     async def get_funding_rate(self, symbol: str) -> Optional[FundingRate]:
         """Get current funding rate for a perp market.
