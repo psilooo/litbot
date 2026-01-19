@@ -1,6 +1,7 @@
 # lithood/hedge.py
 """Perp hedge manager for downside protection and funding yield."""
 
+import asyncio
 import time
 from decimal import Decimal
 from typing import Optional
@@ -56,18 +57,23 @@ class HedgeManager:
 
         if perp_pos:
             entry_price = perp_pos.entry_price
+            actual_size = abs(perp_pos.size)  # position size is negative for short
+            if actual_size != size:
+                log.warning(f"Expected short size {size}, got {actual_size}")
+                size = actual_size  # Use actual size for state
         else:
             # Fallback to mid price if position not yet visible
             mid_price = await self.client.get_mid_price(self.symbol, MarketType.PERP)
-            if mid_price is None:
-                log.error("Failed to get entry price for hedge")
-                entry_price = Decimal("0")
-            else:
+            if mid_price:
                 entry_price = mid_price
+                log.warning("Using mid price as entry estimate - position not yet visible")
+            else:
+                log.error("Cannot determine entry price - aborting hedge open")
+                return
 
         self.state.set("hedge_active", True)
-        self.state.set("hedge_entry_price", float(entry_price))
-        self.state.set("hedge_size", float(size))
+        self.state.set("hedge_entry_price", str(entry_price))
+        self.state.set("hedge_size", str(size))
         self.state.log_hedge_action("open", entry_price, size)
 
         log.info(f"Hedge opened: {size} LIT short @ ${entry_price}")
@@ -78,8 +84,10 @@ class HedgeManager:
             log.warning("No active hedge to close")
             return
 
-        size = Decimal(str(self.state.get("hedge_size", self.config["short_size"])))
-        entry_price = Decimal(str(self.state.get("hedge_entry_price", 0)))
+        size_str = self.state.get("hedge_size")
+        size = Decimal(size_str) if size_str else self.config["short_size"]
+        entry_price_str = self.state.get("hedge_entry_price")
+        entry_price = Decimal(entry_price_str) if entry_price_str else Decimal("0")
 
         log.info(f"Closing hedge short: {size} LIT (reason: {reason})")
 
@@ -95,6 +103,13 @@ class HedgeManager:
             log.error("Failed to close hedge short - order not placed")
             return
 
+        # Verify position is closed
+        await asyncio.sleep(1)  # Brief wait for position update
+        positions = await self.client.get_positions()
+        perp_pos = self._find_position(positions)
+        if perp_pos and perp_pos.size != 0:
+            log.warning(f"Position still exists after close: {perp_pos.size}")
+
         # Calculate PnL
         current_price = await self.client.get_mid_price(self.symbol, MarketType.PERP)
         if current_price is None:
@@ -108,9 +123,10 @@ class HedgeManager:
         self.state.log_hedge_action(reason, current_price, size, pnl=pnl)
 
         # Track total hedge PnL
-        total_pnl = Decimal(str(self.state.get("total_hedge_pnl", 0)))
+        total_pnl_str = self.state.get("total_hedge_pnl")
+        total_pnl = Decimal(total_pnl_str) if total_pnl_str else Decimal("0")
         total_pnl += pnl
-        self.state.set("total_hedge_pnl", float(total_pnl))
+        self.state.set("total_hedge_pnl", str(total_pnl))
 
         log.info(f"Hedge closed @ ${current_price}, PnL: ${pnl:.2f}")
 
