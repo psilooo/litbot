@@ -22,3 +22,4 @@ logs/
 .idea/
 .vscode/
 *.swp
+proxyList.txt
