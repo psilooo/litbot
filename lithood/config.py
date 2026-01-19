@@ -14,6 +14,27 @@ LIGHTER_PRIVATE_KEY = os.getenv("LIGHTER_PRIVATE_KEY", "")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "2"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+# Proxy Configuration
+PROXY_HOST = os.getenv("PROXY_HOST", "")
+PROXY_PORT = os.getenv("PROXY_PORT", "")
+PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
+
+def get_proxy_url() -> str:
+    """Build proxy URL from components. Returns empty string if not configured."""
+    if not PROXY_HOST or not PROXY_PORT:
+        return ""
+    if PROXY_USERNAME and PROXY_PASSWORD:
+        return f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
+    return f"http://{PROXY_HOST}:{PROXY_PORT}"
+
+PROXY_URL = get_proxy_url()
+
+# Set proxy environment variables for aiohttp/requests to pick up
+if PROXY_URL:
+    os.environ["HTTP_PROXY"] = PROXY_URL
+    os.environ["HTTPS_PROXY"] = PROXY_URL
+
 
 @dataclass
 class GridLevel:

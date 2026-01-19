@@ -17,7 +17,7 @@ from lighter import (
     FundingApi,
 )
 
-from lithood.config import LIGHTER_BASE_URL, LIGHTER_PRIVATE_KEY
+from lithood.config import LIGHTER_BASE_URL, LIGHTER_PRIVATE_KEY, PROXY_URL
 from lithood.logger import log
 from lithood.types import (
     Market,
@@ -71,6 +71,10 @@ class LighterClient:
     async def connect(self) -> None:
         """Initialize API clients and load market data."""
         log.info(f"Connecting to Lighter DEX at {self.base_url}")
+        if PROXY_URL:
+            # Mask password in log
+            masked_proxy = PROXY_URL.split("@")[-1] if "@" in PROXY_URL else PROXY_URL
+            log.info(f"Using proxy: {masked_proxy}")
 
         # Initialize API client for read operations
         config = Configuration(host=self.base_url)
