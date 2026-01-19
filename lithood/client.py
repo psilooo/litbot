@@ -1,6 +1,7 @@
 # lithood/client.py
 """Lighter DEX API client wrapper."""
 
+import time
 from decimal import Decimal
 from datetime import datetime
 from typing import Optional
@@ -263,8 +264,9 @@ class LighterClient:
                 )
 
                 for o in result.orders:
+                    # Use order_index for cancellation - it's the integer ID required by the SDK
                     orders.append(Order(
-                        id=o.order_id,
+                        id=str(o.order_index),
                         market_id=o.market_index,
                         side=OrderSide.SELL if o.is_ask else OrderSide.BUY,
                         price=Decimal(o.price),
@@ -411,6 +413,8 @@ class LighterClient:
                     f"Placed {side.value} limit order: {size} @ {price} "
                     f"(market={market.symbol}, tx={resp.tx_hash})"
                 )
+                # Note: id is tx_hash here, not order_index. To cancel this order,
+                # call get_active_orders() to retrieve the order_index assigned by the exchange.
                 return Order(
                     id=resp.tx_hash,
                     market_id=market.market_id,
@@ -493,6 +497,7 @@ class LighterClient:
                     f"Placed {side.value} market order: {size} "
                     f"(market={market.symbol}, tx={resp.tx_hash})"
                 )
+                # Note: id is tx_hash here (market orders fill immediately, so order_index isn't needed)
                 return Order(
                     id=resp.tx_hash,
                     market_id=market.market_id,
@@ -518,7 +523,8 @@ class LighterClient:
         """Cancel an order.
 
         Args:
-            order_id: Order ID string to cancel
+            order_id: Order index as string (from get_active_orders, not from place_limit_order).
+                     The SDK requires the numeric order_index for cancellation.
 
         Returns:
             True if successful, False otherwise
@@ -570,7 +576,6 @@ class LighterClient:
             return 0
 
         try:
-            import time
             timestamp_ms = int(time.time() * 1000)
 
             # If market_id specified, cancel only orders for that market
