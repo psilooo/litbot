@@ -10,7 +10,10 @@ load_dotenv()
 
 # Environment
 LIGHTER_BASE_URL = os.getenv("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
-LIGHTER_PRIVATE_KEY = os.getenv("LIGHTER_PRIVATE_KEY", "")
+LIGHTER_PRIVATE_KEY = os.getenv("LIGHTER_PRIVATE_KEY", "")  # Wallet key (for setup)
+LIGHTER_API_KEY_PRIVATE = os.getenv("LIGHTER_API_KEY_PRIVATE", "")  # API key (for trading)
+LIGHTER_API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "3"))  # API key slot (3-254)
+LIGHTER_ACCOUNT_INDEX = os.getenv("LIGHTER_ACCOUNT_INDEX", "")  # Your account index
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "2"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 

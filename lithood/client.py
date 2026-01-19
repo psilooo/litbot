@@ -17,7 +17,14 @@ from lighter import (
     FundingApi,
 )
 
-from lithood.config import LIGHTER_BASE_URL, LIGHTER_PRIVATE_KEY, PROXY_URL
+from lithood.config import (
+    LIGHTER_BASE_URL,
+    LIGHTER_PRIVATE_KEY,
+    LIGHTER_API_KEY_PRIVATE,
+    LIGHTER_API_KEY_INDEX,
+    LIGHTER_ACCOUNT_INDEX,
+    PROXY_URL,
+)
 from lithood.logger import log
 from lithood.types import (
     Market,
@@ -39,20 +46,34 @@ class LighterClient:
     def __init__(
         self,
         base_url: str = LIGHTER_BASE_URL,
-        private_key: str = LIGHTER_PRIVATE_KEY,
+        wallet_private_key: str = LIGHTER_PRIVATE_KEY,
+        api_key_private: str = LIGHTER_API_KEY_PRIVATE,
+        api_key_index: int = LIGHTER_API_KEY_INDEX,
+        account_index: Optional[int] = None,
     ):
         """Initialize the client.
 
         Args:
             base_url: Lighter API base URL
-            private_key: Private key for signing transactions
+            wallet_private_key: Wallet private key (for account lookup)
+            api_key_private: API key private key (for signing orders)
+            api_key_index: API key index (3-254)
+            account_index: Account index (optional, will be looked up if not provided)
         """
         self.base_url = base_url
-        self.private_key = private_key
+        self.wallet_private_key = wallet_private_key
+        self.api_key_private = api_key_private
+        self.api_key_index = api_key_index
 
-        # Derive L1 address from private key
-        if private_key:
-            eth_account = EthAccount.from_key(private_key)
+        # Use provided account index or look it up later
+        if LIGHTER_ACCOUNT_INDEX:
+            self.account_index = int(LIGHTER_ACCOUNT_INDEX)
+        else:
+            self.account_index = account_index
+
+        # Derive L1 address from wallet private key (for account lookup)
+        if wallet_private_key:
+            eth_account = EthAccount.from_key(wallet_private_key)
             self.l1_address = eth_account.address
         else:
             self.l1_address = ""
@@ -60,7 +81,6 @@ class LighterClient:
         # These will be initialized in connect()
         self.api_client: Optional[ApiClient] = None
         self.signer_client: Optional[SignerClient] = None
-        self.account_index: Optional[int] = None
         self.account_api: Optional[AccountApi] = None
         self.order_api: Optional[OrderApi] = None
         self.funding_api: Optional[FundingApi] = None
@@ -85,8 +105,8 @@ class LighterClient:
         self.order_api = OrderApi(self.api_client)
         self.funding_api = FundingApi(self.api_client)
 
-        # Get account index from L1 address
-        if self.l1_address:
+        # Get account index from L1 address if not already set
+        if self.account_index is None and self.l1_address:
             try:
                 sub_accounts = await self.account_api.accounts_by_l1_address(
                     l1_address=self.l1_address
@@ -99,15 +119,19 @@ class LighterClient:
             except Exception as e:
                 log.error(f"Failed to get account index: {e}")
                 raise
+        elif self.account_index is not None:
+            log.info(f"Using configured account index: {self.account_index}")
 
-        # Initialize signer client for write operations
-        if self.private_key and self.account_index is not None:
+        # Initialize signer client for write operations (using API key)
+        if self.api_key_private and self.account_index is not None:
             self.signer_client = SignerClient(
                 url=self.base_url,
                 account_index=self.account_index,
-                api_private_keys={SignerClient.DEFAULT_API_KEY_INDEX: self.private_key},
+                api_private_keys={self.api_key_index: self.api_key_private},
             )
-            log.info("Signer client initialized")
+            log.info(f"Signer client initialized with API key index {self.api_key_index}")
+        elif not self.api_key_private:
+            log.warning("No API key configured - read-only mode (cannot place orders)")
 
         # Load market data
         await self._load_markets()
