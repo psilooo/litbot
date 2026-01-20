@@ -1,9 +1,10 @@
 # lithood/client.py
-"""Lighter DEX API client wrapper."""
+"""Lighter DEX API client wrapper with retry logic and connection monitoring."""
 
+import asyncio
 import time
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from eth_account import Account as EthAccount
@@ -36,7 +37,16 @@ from lithood.types import (
     TimeInForce,
     Position,
     Account,
+    AssetBalance,
     FundingRate,
+)
+from lithood.retry import (
+    retry_async,
+    ConnectionMonitor,
+    RETRY_FAST,
+    RETRY_STANDARD,
+    RETRY_PERSISTENT,
+    is_transient_error,
 )
 
 
@@ -88,6 +98,10 @@ class LighterClient:
         # Market cache: key = "{symbol}_{market_type}"
         self._markets: dict[str, Market] = {}
 
+        # Connection monitoring
+        self._connection_monitor = ConnectionMonitor(self._reconnect)
+        self._last_successful_op = time.time()
+
     async def connect(self) -> None:
         """Initialize API clients and load market data."""
         log.info(f"Connecting to Lighter DEX at {self.base_url}")
@@ -98,6 +112,8 @@ class LighterClient:
 
         # Initialize API client for read operations
         config = Configuration(host=self.base_url)
+        if PROXY_URL:
+            config.proxy = PROXY_URL
         self.api_client = ApiClient(configuration=config)
 
         # Initialize API endpoints
@@ -129,13 +145,76 @@ class LighterClient:
                 account_index=self.account_index,
                 api_private_keys={self.api_key_index: self.api_key_private},
             )
+            # Apply proxy to signer client's internal api_client
+            if PROXY_URL:
+                self.signer_client.api_client.configuration.proxy = PROXY_URL
+                log.info(f"Signer client proxy configured")
             log.info(f"Signer client initialized with API key index {self.api_key_index}")
         elif not self.api_key_private:
             log.warning("No API key configured - read-only mode (cannot place orders)")
 
         # Load market data
         await self._load_markets()
+        self._connection_monitor.record_success()
         log.info(f"Connected. Loaded {len(self._markets)} markets.")
+
+    async def _reconnect(self) -> None:
+        """Reconnect to the exchange after connection loss."""
+        log.info("Attempting to reconnect to exchange...")
+
+        # Close existing connections
+        try:
+            if self.api_client:
+                await self.api_client.close()
+            if self.signer_client:
+                await self.signer_client.close()
+        except Exception:
+            pass  # Ignore errors during cleanup
+
+        # Re-initialize
+        config = Configuration(host=self.base_url)
+        if PROXY_URL:
+            config.proxy = PROXY_URL
+        self.api_client = ApiClient(configuration=config)
+
+        self.account_api = AccountApi(self.api_client)
+        self.order_api = OrderApi(self.api_client)
+        self.funding_api = FundingApi(self.api_client)
+
+        if self.api_key_private and self.account_index is not None:
+            self.signer_client = SignerClient(
+                url=self.base_url,
+                account_index=self.account_index,
+                api_private_keys={self.api_key_index: self.api_key_private},
+            )
+            if PROXY_URL:
+                self.signer_client.api_client.configuration.proxy = PROXY_URL
+
+        # Verify connection by loading markets
+        await self._load_markets()
+        log.info("Reconnection successful")
+
+    async def ensure_connected(self) -> bool:
+        """Ensure connection is healthy, reconnect if needed."""
+        return await self._connection_monitor.ensure_connected()
+
+    async def health_check(self) -> bool:
+        """Quick health check - try to fetch orderbook."""
+        try:
+            if not self.order_api:
+                return False
+            # Try to get orderbook details (lightweight call)
+            await self.order_api.order_book_details()
+            self._connection_monitor.record_success()
+            return True
+        except Exception as e:
+            log.warning(f"Health check failed: {e}")
+            self._connection_monitor.record_failure()
+            return False
+
+    def is_connected(self) -> bool:
+        """Check if we believe we're connected."""
+        return self._connection_monitor.is_connected
 
     async def close(self) -> None:
         """Clean up connections."""
@@ -245,12 +324,29 @@ class LighterClient:
                     liquidation_price=Decimal(pos.liquidation_price) if pos.liquidation_price else None,
                 ))
 
+            # Parse spot asset balances
+            assets = []
+            if hasattr(acc, 'assets') and acc.assets:
+                for asset in acc.assets:
+                    assets.append(AssetBalance(
+                        asset_id=asset.asset_id,
+                        balance=Decimal(str(asset.balance)) if asset.balance else Decimal("0"),
+                        locked_balance=Decimal(str(asset.locked_balance)) if hasattr(asset, 'locked_balance') and asset.locked_balance else Decimal("0"),
+                    ))
+
+            # Get total asset value if available
+            total_asset_value = Decimal("0")
+            if hasattr(acc, 'total_asset_value') and acc.total_asset_value:
+                total_asset_value = Decimal(str(acc.total_asset_value))
+
             return Account(
                 index=acc.index,
                 l1_address=acc.l1_address,
                 collateral=Decimal(acc.collateral),
                 available_balance=Decimal(acc.available_balance) if acc.available_balance else Decimal("0"),
                 positions=positions,
+                assets=assets,
+                total_asset_value=total_asset_value,
             )
 
         except Exception as e:
@@ -276,14 +372,19 @@ class LighterClient:
         market_ids = [market_id] if market_id else [m.market_id for m in self._markets.values()]
 
         orders = []
+        auth_failures = 0
         for mid in market_ids:
             try:
                 # Create auth token
                 auth_token = None
                 if self.signer_client:
-                    auth_token = self.signer_client.create_auth_token_with_expiry(
+                    auth_token, auth_error = self.signer_client.create_auth_token_with_expiry(
                         SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY
                     )
+                    if auth_error:
+                        auth_failures += 1
+                        log.error(f"Failed to create auth token for market {mid}: {auth_error}")
+                        continue
 
                 result = await self.order_api.account_active_orders(
                     account_index=self.account_index,
@@ -300,13 +401,17 @@ class LighterClient:
                         price=Decimal(o.price),
                         size=Decimal(o.initial_base_amount),
                         status=self._parse_order_status(o.status),
-                        order_type=OrderType.LIMIT if o.type == "limit" else OrderType.MARKET,
+                        order_type=self._parse_order_type(o.type),
                         created_at=datetime.fromtimestamp(o.created_at / 1000) if o.created_at else datetime.now(),
                         filled_size=Decimal(o.filled_base_amount),
                     ))
 
             except Exception as e:
                 log.error(f"Failed to get active orders for market {mid}: {e}")
+
+        # Raise if all markets failed due to auth errors
+        if auth_failures > 0 and auth_failures == len(market_ids):
+            raise RuntimeError(f"Auth token creation failed for all {auth_failures} markets")
 
         return orders
 
@@ -319,6 +424,18 @@ class LighterClient:
             "partial": OrderStatus.PARTIALLY_FILLED,
         }
         return status_map.get(status.lower(), OrderStatus.PENDING)
+
+    def _parse_order_type(self, order_type: str) -> OrderType:
+        """Parse order type string to enum."""
+        type_map = {
+            "limit": OrderType.LIMIT,
+            "market": OrderType.MARKET,
+            "stop_loss": OrderType.STOP_LOSS,
+            "stop_loss_limit": OrderType.STOP_LOSS_LIMIT,
+            "take_profit": OrderType.TAKE_PROFIT,
+            "take_profit_limit": OrderType.TAKE_PROFIT_LIMIT,
+        }
+        return type_map.get(order_type.lower(), OrderType.LIMIT)
 
     async def get_mid_price(self, symbol: str, market_type: MarketType) -> Optional[Decimal]:
         """Get mid price from orderbook.
@@ -388,7 +505,7 @@ class LighterClient:
         size: Decimal,
         post_only: bool = True,
     ) -> Optional[Order]:
-        """Place a limit order.
+        """Place a limit order with retry logic.
 
         Args:
             symbol: Market symbol (e.g., "LIT")
@@ -410,7 +527,7 @@ class LighterClient:
             log.error(f"Market not found: {symbol}_{market_type.value}")
             return None
 
-        try:
+        async def _place_order():
             is_ask = 1 if side == OrderSide.SELL else 0
             price_int = self._to_price_int(price, market)
             size_int = self._to_size_int(size, market)
@@ -433,33 +550,47 @@ class LighterClient:
             )
 
             if error:
+                # Check if it's a transient error worth retrying
+                if is_transient_error(Exception(str(error))):
+                    raise ConnectionError(f"Transient error: {error}")
                 log.error(f"Failed to place limit order: {error}")
                 return None
 
             if resp and resp.tx_hash:
-                log.info(
-                    f"Placed {side.value} limit order: {size} @ {price} "
-                    f"(market={market.symbol}, tx={resp.tx_hash})"
-                )
-                # Note: id is tx_hash here, not order_index. To cancel this order,
-                # call get_active_orders() to retrieve the order_index assigned by the exchange.
+                self._connection_monitor.record_success()
+                # Use order_index as id for cancellation if available, otherwise tx_hash
+                order_id = str(resp.order_index) if hasattr(resp, 'order_index') and resp.order_index else resp.tx_hash
                 return Order(
-                    id=resp.tx_hash,
+                    id=order_id,
                     market_id=market.market_id,
                     side=side,
                     price=price,
                     size=size,
                     status=OrderStatus.PENDING,
                     order_type=OrderType.LIMIT,
+                    tx_hash=resp.tx_hash,
                     created_at=datetime.now(),
                     filled_size=Decimal("0"),
                 )
-
             return None
 
-        except Exception as e:
-            log.error(f"Failed to place limit order: {e}")
+        result, error = await retry_async(
+            _place_order,
+            config=RETRY_STANDARD,
+            operation_name=f"place {side.value} limit order @ {price}",
+        )
+
+        if error:
+            self._connection_monitor.record_failure()
             return None
+
+        if result:
+            log.info(
+                f"Placed {side.value} limit order: {size} @ {price} "
+                f"(market={market.symbol}, id={result.id}, tx={result.tx_hash})"
+            )
+
+        return result
 
     async def place_market_order(
         self,
@@ -468,7 +599,7 @@ class LighterClient:
         side: OrderSide,
         size: Decimal,
     ) -> Optional[Order]:
-        """Place a market order.
+        """Place a market order with retry logic.
 
         Args:
             symbol: Market symbol (e.g., "LIT")
@@ -488,15 +619,25 @@ class LighterClient:
             log.error(f"Market not found: {symbol}_{market_type.value}")
             return None
 
-        try:
+        # Capture position before order for fill verification (perp markets only)
+        position_before: Optional[Decimal] = None
+        if market_type == MarketType.PERP:
+            positions = await self.get_positions()
+            for pos in positions:
+                if pos.market_id == market.market_id:
+                    position_before = pos.size
+                    break
+            if position_before is None:
+                position_before = Decimal("0")
+
+        async def _place_order():
             is_ask = 1 if side == OrderSide.SELL else 0
             size_int = self._to_size_int(size, market)
 
             # Get current price for avg_execution_price
             mid_price = await self.get_mid_price(symbol, market_type)
             if not mid_price:
-                log.error("Cannot place market order: no mid price available")
-                return None
+                raise ConnectionError("Cannot place market order: no mid price available")
 
             # Use mid price with 1% slippage
             slippage = Decimal("0.01")
@@ -517,42 +658,90 @@ class LighterClient:
             )
 
             if error:
+                if is_transient_error(Exception(str(error))):
+                    raise ConnectionError(f"Transient error: {error}")
                 log.error(f"Failed to place market order: {error}")
                 return None
 
             if resp and resp.tx_hash:
-                log.info(
-                    f"Placed {side.value} market order: {size} "
-                    f"(market={market.symbol}, tx={resp.tx_hash})"
-                )
-                # Note: id is tx_hash here (market orders fill immediately, so order_index isn't needed)
+                self._connection_monitor.record_success()
+                # Use order_index as id for cancellation if available, otherwise tx_hash
+                order_id = str(resp.order_index) if hasattr(resp, 'order_index') and resp.order_index else resp.tx_hash
                 return Order(
-                    id=resp.tx_hash,
+                    id=order_id,
                     market_id=market.market_id,
                     side=side,
                     price=avg_price,
                     size=size,
-                    status=OrderStatus.FILLED,
+                    status=OrderStatus.PENDING,  # Will be verified below
                     order_type=OrderType.MARKET,
+                    tx_hash=resp.tx_hash,
                     created_at=datetime.now(),
-                    filled_size=size,
+                    filled_size=Decimal("0"),  # Will be verified below
                 )
-
             return None
 
-        except Exception as e:
-            log.error(f"Failed to place market order: {e}")
+        result, error = await retry_async(
+            _place_order,
+            config=RETRY_STANDARD,
+            operation_name=f"place {side.value} market order",
+        )
+
+        if error:
+            self._connection_monitor.record_failure()
             return None
+
+        if result:
+            # Verify actual fill by querying position change (perp markets only)
+            if market_type == MarketType.PERP and position_before is not None:
+                await asyncio.sleep(0.5)  # Brief delay for settlement
+                positions = await self.get_positions()
+                position_after = Decimal("0")
+                for pos in positions:
+                    if pos.market_id == market.market_id:
+                        position_after = pos.size
+                        break
+
+                # Calculate actual filled size from position change
+                position_delta = abs(position_after - position_before)
+                if position_delta > 0:
+                    result.filled_size = position_delta
+                    result.status = OrderStatus.FILLED if position_delta >= size else OrderStatus.PARTIALLY_FILLED
+                    log.info(
+                        f"Market order fill verified: requested={size}, filled={position_delta} "
+                        f"(position: {position_before} -> {position_after})"
+                    )
+                else:
+                    # No position change detected - order may have failed or not settled
+                    result.status = OrderStatus.PENDING
+                    log.warning(
+                        f"Market order fill not verified: no position change detected "
+                        f"(tx={result.tx_hash})"
+                    )
+            else:
+                # For spot markets, assume filled (no position tracking available)
+                result.filled_size = size
+                result.status = OrderStatus.FILLED
+
+            log.info(
+                f"Placed {side.value} market order: {size} "
+                f"(market={market.symbol}, id={result.id}, tx={result.tx_hash}, "
+                f"status={result.status.value}, filled={result.filled_size})"
+            )
+
+        return result
 
     async def cancel_order(
         self,
         order_id: str,
+        market_id: Optional[int] = None,
     ) -> bool:
         """Cancel an order.
 
         Args:
             order_id: Order index as string (from get_active_orders, not from place_limit_order).
                      The SDK requires the numeric order_index for cancellation.
+            market_id: Market ID for the order. If not provided, will search active orders (slow).
 
         Returns:
             True if successful, False otherwise
@@ -564,15 +753,17 @@ class LighterClient:
         try:
             order_index = int(order_id)
 
-            # Find the order in active orders to get its market_id
-            active_orders = await self.get_active_orders()
-            order = next((o for o in active_orders if o.id == order_id), None)
-            if not order:
-                log.error(f"Order not found: {order_id}")
-                return False
+            # Use provided market_id or search for it
+            if market_id is None:
+                active_orders = await self.get_active_orders()
+                order = next((o for o in active_orders if o.id == order_id), None)
+                if not order:
+                    log.error(f"Order not found: {order_id}")
+                    return False
+                market_id = order.market_id
 
             tx, resp, error = await self.signer_client.cancel_order(
-                market_index=order.market_id,
+                market_index=market_id,
                 order_index=order_index,
             )
 
@@ -688,3 +879,89 @@ class LighterClient:
         if not account:
             return []
         return account.positions
+
+    async def place_stop_loss_order(
+        self,
+        symbol: str,
+        market_type: MarketType,
+        side: OrderSide,
+        size: Decimal,
+        trigger_price: Decimal,
+        reduce_only: bool = True,
+    ) -> Optional[Order]:
+        """Place a stop-loss market order.
+
+        The order triggers when price crosses the trigger_price.
+        For a SHORT position stop-loss: side=BUY, triggers when price rises to trigger_price.
+        For a LONG position stop-loss: side=SELL, triggers when price falls to trigger_price.
+
+        Args:
+            symbol: Market symbol (e.g., "LIT")
+            market_type: Market type (SPOT or PERP)
+            side: BUY (to close short) or SELL (to close long)
+            size: Order size in base asset
+            trigger_price: Price at which to trigger the stop
+            reduce_only: If True, only reduces position (default True for stop-loss)
+
+        Returns:
+            Order object if successful, None otherwise
+        """
+        if not self.signer_client:
+            log.error("Signer client not initialized")
+            return None
+
+        market = self.get_market(symbol, market_type)
+        if not market:
+            log.error(f"Market not found: {symbol}_{market_type.value}")
+            return None
+
+        try:
+            is_ask = 1 if side == OrderSide.SELL else 0
+            size_int = self._to_size_int(size, market)
+            trigger_price_int = self._to_price_int(trigger_price, market)
+
+            # For stop-loss market order, use trigger_price as price too
+            # (will execute at market when triggered)
+            price_int = trigger_price_int
+
+            tx, resp, error = await self.signer_client.create_order(
+                market_index=market.market_id,
+                client_order_index=0,
+                base_amount=size_int,
+                price=price_int,
+                is_ask=is_ask,
+                order_type=SignerClient.ORDER_TYPE_STOP_LOSS,
+                time_in_force=SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                reduce_only=reduce_only,
+                trigger_price=trigger_price_int,
+            )
+
+            if error:
+                log.error(f"Failed to place stop-loss order: {error}")
+                return None
+
+            if resp and resp.tx_hash:
+                # Use order_index as id for cancellation if available, otherwise tx_hash
+                order_id = str(resp.order_index) if hasattr(resp, 'order_index') and resp.order_index else resp.tx_hash
+                log.info(
+                    f"Placed STOP-LOSS {side.value} order: {size} @ trigger ${trigger_price} "
+                    f"(market={market.symbol}, id={order_id}, tx={resp.tx_hash})"
+                )
+                return Order(
+                    id=order_id,
+                    market_id=market.market_id,
+                    side=side,
+                    price=trigger_price,
+                    size=size,
+                    status=OrderStatus.PENDING,
+                    order_type=OrderType.STOP_LOSS,
+                    tx_hash=resp.tx_hash,
+                    created_at=datetime.now(),
+                    filled_size=Decimal("0"),
+                )
+
+            return None
+
+        except Exception as e:
+            log.error(f"Failed to place stop-loss order: {e}")
+            return None

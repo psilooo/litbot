@@ -1,69 +1,153 @@
 # lithood/grid.py
-"""Spot grid trading engine.
+"""Spot grid trading engine with fixed-level cycling.
 
-IMPORTANT: Order ID handling
------------------------------
+DESIGN:
+-------
+- Grid levels spaced 2% apart (both buys and sells)
+- Cycle spread also 2%, so counter-orders land exactly on grid levels
+- When buy fills at level N → sell at level N+1 (2% higher)
+- When sell fills at level N → buy at level N-1 (2% lower)
+- No drift: counter-orders always snap to nearest grid level
+
+Order ID handling
+-----------------
 When placing orders via client.place_limit_order(), the returned Order has id=tx_hash.
 When querying active orders via client.get_active_orders(), Orders have id=order_index.
 
-These are different values! The grid tracks orders by tx_hash (from placement), but
-fill detection compares against order_index (from active orders query).
-
-To handle this mismatch, we store both:
-- The tx_hash as the primary key for our local order tracking
-- We lookup orders by price/side/market to match fills since we can't rely on ID matching
-
-Future improvement: Use WebSocket fill notifications which include tx_hash for reliable matching.
+These are different values! We lookup orders by price/side/market to match fills.
 """
 
+from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Dict, Set
 
 from lithood.client import LighterClient
 from lithood.state import StateManager
-from lithood.types import Order, OrderSide, MarketType
+from lithood.types import Order, OrderSide, MarketType, OrderStatus
 from lithood.config import (
-    GRID_BUY_LEVELS, GRID_SELL_LEVELS,
-    GRID_SPREAD, GRID_PROFIT_RETAIN
+    generate_grid_pairs, generate_full_grid_ladder, GridPair, GRID_CONFIG,
+    GRID_PROFIT_RETAIN, SPOT_SYMBOL,
 )
 from lithood.logger import log
 
+# Cycle spread - must equal level spacing to prevent drift
+CYCLE_SPREAD = GRID_CONFIG["cycle_spread_pct"]
+
 
 class GridEngine:
-    """Manages spot grid trading."""
+    """Manages spot grid trading with fixed-level cycling."""
 
     def __init__(self, client: LighterClient, state: StateManager):
         self.client = client
         self.state = state
-        self.symbol = "LIT"
+        self.symbol = SPOT_SYMBOL  # "LIT/USDC" for spot market
         self.market_type = MarketType.SPOT
+        self.grid_levels: list[GridPair] = []  # Initial grid levels
+        self._grid_prices: Set[Decimal] = set()  # All valid grid prices for snapping
 
     async def initialize(self):
-        """Place initial grid orders based on current price."""
-        current_price = await self.client.get_mid_price(self.symbol, self.market_type)
-        if current_price is None:
+        """Generate grid levels and place initial orders based on current price."""
+        entry_price = await self.client.get_mid_price(self.symbol, self.market_type)
+        if entry_price is None:
             log.error("Failed to get mid price - cannot initialize grid")
             return
 
-        log.info(f"Initializing grid. Current price: ${current_price}")
+        # Clear stale pending orders from previous runs
+        # (they have different prices and would cause false fill detection)
+        await self._clear_stale_pending_orders()
+
+        # Store entry price for reference
+        self.state.set("bot_entry_price", str(entry_price))
+        self.state.set("grid_entry_price", str(entry_price))
+
+        log.info(f"Initializing grid. Entry price: ${entry_price}")
 
         if self.state.get("grid_paused"):
             log.warning("Grid is paused - skipping initialization")
             return
 
-        # Place buy orders below current price
-        for i, level in enumerate(GRID_BUY_LEVELS):
-            if level.price < current_price:
-                await self._place_grid_buy(level.price, level.size, grid_level=i+1)
+        # Generate grid levels for initial placement
+        self.grid_levels = generate_grid_pairs(entry_price)
 
-        # Place sell orders above current price
-        for i, level in enumerate(GRID_SELL_LEVELS):
-            if level.price > current_price:
-                await self._place_grid_sell(level.price, level.size, grid_level=i+1)
+        # Build FULL price ladder for snapping (includes entry and all intermediate levels)
+        # This ensures counter-orders can snap even when they fall in the "dead zone"
+        self._grid_prices = set(generate_full_grid_ladder(entry_price))
+
+        # Log the generated grid
+        log.info(f"Generated {len(self.grid_levels)} grid levels (2% spacing):")
+        for level in self.grid_levels:
+            log.info(f"  Level {level.pair_id}: Buy ${level.buy_price} / Sell ${level.sell_price}")
+
+        # Place initial orders - buys below entry, sells above entry
+        for level in self.grid_levels:
+            if level.buy_price < entry_price:
+                await self._place_grid_buy(
+                    price=level.buy_price,
+                    usdc_amount=level.usdc_size,
+                    level_id=level.pair_id
+                )
+
+            if level.sell_price > entry_price:
+                await self._place_grid_sell(
+                    price=level.sell_price,
+                    lit_amount=level.lit_size,
+                    level_id=level.pair_id
+                )
 
         log.info("Grid initialized")
 
-    async def _place_grid_buy(self, price: Decimal, usdc_amount: Decimal, grid_level: Optional[int] = None) -> Optional[Order]:
+    async def _clear_stale_pending_orders(self):
+        """Clear stale pending orders from previous runs.
+
+        On restart, the grid generates new prices based on current entry price.
+        Old pending orders in state would have different prices and cause
+        false fill detection. Cancel them on the exchange and clear local state.
+        """
+        market = self.client.get_market(self.symbol, self.market_type)
+        if market is None:
+            return
+
+        # First cancel all orders on the exchange for this market
+        # This ensures we don't leave orphan orders on the exchange
+        try:
+            cancelled = await self.client.cancel_all_orders(market_id=market.market_id)
+            if cancelled > 0:
+                log.info(f"Cancelled {cancelled} orders on exchange during startup cleanup")
+        except Exception as e:
+            log.warning(f"Failed to cancel exchange orders during cleanup: {e}")
+
+        # Then clear local state
+        stale_count = 0
+        for order in self.state.get_pending_orders():
+            if order.market_id == market.market_id:
+                self.state.mark_cancelled(order.id)
+                stale_count += 1
+
+        if stale_count > 0:
+            log.info(f"Cleared {stale_count} stale pending orders from local state")
+
+    def _snap_to_grid(self, price: Decimal) -> Decimal:
+        """Snap a calculated price to the nearest grid level.
+
+        This prevents floating-point drift by ensuring counter-orders
+        always land exactly on predefined grid levels.
+        """
+        if not self._grid_prices:
+            # No grid prices yet, return as-is
+            return price.quantize(Decimal("0.0001"))
+
+        # Find the closest grid price
+        closest = min(self._grid_prices, key=lambda p: abs(p - price))
+
+        # Only snap if within 1% of a grid level (sanity check)
+        if abs(closest - price) / price < Decimal("0.01"):
+            return closest
+
+        # If no close grid level, return quantized price (shouldn't happen normally)
+        log.warning(f"Price ${price} not near any grid level, using as-is")
+        return price.quantize(Decimal("0.0001"))
+
+    async def _place_grid_buy(self, price: Decimal, usdc_amount: Decimal, level_id: int = 0) -> Optional[Order]:
         """Place a grid buy order."""
         if self.state.get("grid_paused"):
             log.debug(f"Grid paused - skipping buy at ${price}")
@@ -83,14 +167,18 @@ class GridEngine:
             log.error(f"Failed to place grid buy at ${price}")
             return None
 
-        order.grid_level = grid_level
+        order.grid_level = level_id
         self.state.save_order(order)
 
-        log.info(f"Grid buy placed: {size:.2f} LIT @ ${price} (level {grid_level})")
+        log.info(f"Grid BUY placed: {size:.2f} LIT @ ${price}")
         return order
 
-    async def _place_grid_sell(self, price: Decimal, lit_amount: Decimal, grid_level: Optional[int] = None) -> Optional[Order]:
+    async def _place_grid_sell(self, price: Decimal, lit_amount: Decimal, level_id: int = 0) -> Optional[Order]:
         """Place a grid sell order."""
+        if self.state.get("grid_paused"):
+            log.debug(f"Grid paused - skipping sell at ${price}")
+            return None
+
         order = await self.client.place_limit_order(
             symbol=self.symbol,
             market_type=self.market_type,
@@ -102,36 +190,20 @@ class GridEngine:
             log.error(f"Failed to place grid sell at ${price}")
             return None
 
-        order.grid_level = grid_level
+        order.grid_level = level_id
         self.state.save_order(order)
 
-        log.info(f"Grid sell placed: {lit_amount:.2f} LIT @ ${price} (level {grid_level})")
+        log.info(f"Grid SELL placed: {lit_amount:.2f} LIT @ ${price}")
         return order
 
     async def check_fills(self):
         """Check for filled orders and trigger cycling.
 
-        IMPORTANT: Order ID mismatch handling
-        -------------------------------------
-        Our locally stored orders have id=tx_hash (from place_limit_order).
-        Active orders from the exchange have id=order_index (different value).
+        Uses price-based matching since order IDs differ between
+        placement (tx_hash) and query (order_index).
 
-        Since IDs don't match, we use price-based matching:
-        - Build a set of (price, side) tuples from active exchange orders
-        - If a pending local order's (price, side) is not in the active set, it was filled
-
-        LIMITATION: Partial fills and other edge cases
-        -----------------------------------------------
-        An order may disappear from active orders due to:
-        - Full fill (what we assume)
-        - Partial fill followed by cancellation
-        - Order expiration (TIME_IN_FORCE timeout)
-        - User cancellation via another client
-
-        For now, we assume any missing order was fully filled. This is a known
-        limitation. Proper handling requires either:
-        - Order history API (to check actual fill status)
-        - WebSocket fill notifications (preferred for real-time detection)
+        Handles both full fills (order disappears) and partial fills
+        (order still active but filled_size increased).
         """
         if self.state.get("grid_paused"):
             return
@@ -144,52 +216,112 @@ class GridEngine:
 
         active_orders = await self.client.get_active_orders(market_id=market.market_id)
 
-        # Build set of (price, side) for matching since order IDs don't match
-        # (local orders use tx_hash, exchange orders use order_index)
-        active_price_side = {(o.price, o.side) for o in active_orders}
+        # Build map of (price, side) -> exchange order for partial fill detection
+        active_order_map: Dict[tuple[Decimal, OrderSide], Order] = {}
+        for o in active_orders:
+            active_order_map[(o.price, o.side)] = o
 
-        # Check our pending orders
-        for order in self.state.get_pending_orders():
+        # Grace period: don't check orders placed less than 30 seconds ago
+        # (they may not have propagated to the exchange yet)
+        grace_cutoff = datetime.now() - timedelta(seconds=30)
+
+        # Check our pending and partially filled orders
+        # (partially filled orders need continued monitoring for more fills)
+        orders_to_check = (
+            self.state.get_pending_orders()
+            + self.state.get_orders_by_status(OrderStatus.PARTIALLY_FILLED)
+        )
+        for order in orders_to_check:
             if order.market_id != market.market_id:
                 continue
 
-            if (order.price, order.side) not in active_price_side:
-                # Order is no longer active at this price/side - assume filled
-                # NOTE: See docstring for limitations of this approach
-                await self._on_fill(order)
+            # Skip orders that are too new (grace period)
+            if order.created_at > grace_cutoff:
+                continue
 
-    async def _on_fill(self, order: Order):
-        """Handle a filled order - place the opposite side.
+            key = (order.price, order.side)
+            exchange_order = active_order_map.get(key)
 
-        Preserves the original order's grid_level so we can track which
-        level a cycling order originated from.
+            if exchange_order is None:
+                # Order is no longer active - fully filled
+                filled_size = order.size  # Assume full size was filled
+                await self._on_fill(order, filled_size)
+            elif exchange_order.filled_size > order.filled_size:
+                # Order is still active but has new partial fill
+                new_fill_amount = exchange_order.filled_size - order.filled_size
+                log.info(
+                    f"Partial fill detected: {new_fill_amount:.4f} of {order.size:.4f} "
+                    f"@ ${order.price} ({order.side.value})"
+                )
+                # Update local state with new filled amount
+                self.state.mark_partially_filled(order.id, exchange_order.filled_size)
+                # Place counter-order for only the newly filled portion
+                await self._on_fill(order, new_fill_amount)
+
+    async def _on_fill(self, order: Order, filled_size: Decimal):
+        """Handle a filled order - place counter-order at the adjacent grid level.
+
+        Args:
+            order: The order that was filled (or partially filled)
+            filled_size: The amount that was filled (may be less than order.size for partials)
+
+        FIXED-LEVEL CYCLING:
+        - Buy fills → sell at next level up (order.price × 1.02, snapped to grid)
+        - Sell fills → buy at next level down (order.price × 0.98, snapped to grid)
+
+        Since level spacing = cycle spread = 2%, counter-orders land exactly on grid levels.
+        Snapping ensures no floating-point drift over time.
         """
-        self.state.mark_filled(order.id)
+        is_full_fill = filled_size >= order.size
+        if is_full_fill:
+            self.state.mark_filled(order.id, filled_size)
+
+        # Check pause status before placing counter-orders
+        if self.state.get("grid_paused"):
+            fill_type = "full" if is_full_fill else "partial"
+            log.info(f"Grid paused - not placing counter-order for {fill_type} fill at ${order.price}")
+            return
+
+        # Get level_id for tracking (use existing or assign 0)
+        level_id = order.grid_level or 0
 
         if order.side == OrderSide.BUY:
-            # Buy filled -> place sell at +3%
-            sell_price = order.price * (1 + GRID_SPREAD)
-            sell_size = order.size  # Sell the LIT we just bought
+            # Buy filled -> place sell one level up (2% higher)
+            raw_price = order.price * (1 + CYCLE_SPREAD)
+            sell_price = self._snap_to_grid(raw_price)
+            sell_size = filled_size  # Sell only the LIT we actually bought
 
-            log.info(f"Buy filled @ ${order.price} -> placing sell @ ${sell_price}")
-            # Preserve grid_level from the original buy order
-            await self._place_grid_sell(sell_price, sell_size, grid_level=order.grid_level)
+            log.info(f"BUY FILLED @ ${order.price} -> placing sell @ ${sell_price} (next level up)")
+            await self._place_grid_sell(sell_price, sell_size, level_id=level_id)
+
+            # Increment fill counter
+            fills = int(self.state.get("grid_buy_fills", "0"))
+            self.state.set("grid_buy_fills", str(fills + 1))
 
         else:
-            # Sell filled -> place buy at -3%, keeping 3% profit
-            buy_price = order.price * (1 - GRID_SPREAD)
-            usdc_received = order.size * order.price
+            # Sell filled -> place buy one level down (2% lower)
+            raw_price = order.price * (1 - CYCLE_SPREAD)
+            buy_price = self._snap_to_grid(raw_price)
+            usdc_received = filled_size * order.price
             usdc_to_reinvest = usdc_received * (1 - GRID_PROFIT_RETAIN)
+            realized_profit = usdc_received * GRID_PROFIT_RETAIN
 
-            log.info(f"Sell filled @ ${order.price} -> placing buy @ ${buy_price}")
-            log.info(f"  Profit retained: ${usdc_received * GRID_PROFIT_RETAIN:.2f}")
-            # Preserve grid_level from the original sell order
-            await self._place_grid_buy(buy_price, usdc_to_reinvest, grid_level=order.grid_level)
+            log.info(f"SELL FILLED @ ${order.price} -> placing buy @ ${buy_price} (next level down)")
+            log.info(f"  Profit retained: ${realized_profit:.2f}")
 
-            # Update profit tracking (store as string for Decimal precision)
+            await self._place_grid_buy(buy_price, usdc_to_reinvest, level_id=level_id)
+
+            # Update profit tracking
             total_profit = Decimal(self.state.get("total_grid_profit", "0"))
-            total_profit += usdc_received * GRID_PROFIT_RETAIN
+            total_profit += realized_profit
             self.state.set("total_grid_profit", str(total_profit))
+
+            # Increment fill and cycle counters
+            fills = int(self.state.get("grid_sell_fills", "0"))
+            self.state.set("grid_sell_fills", str(fills + 1))
+
+            cycles = int(self.state.get("grid_cycles", "0"))
+            self.state.set("grid_cycles", str(cycles + 1))
 
     def pause(self):
         """Pause all grid trading activity (called by floor protection).
@@ -205,7 +337,7 @@ class GridEngine:
         self.state.set("grid_paused", True)
         log.warning("Grid trading PAUSED")
 
-    # Alias for backward compatibility - pause_buys actually pauses all grid activity
+    # Alias for backward compatibility
     pause_buys = pause
 
     def resume(self):
@@ -237,4 +369,8 @@ class GridEngine:
         profit_str = self.state.get("total_grid_profit", "0")
         stats["total_profit"] = Decimal(profit_str) if profit_str else Decimal("0")
         stats["paused"] = self.state.get("grid_paused", False)
+        stats["buy_fills"] = int(self.state.get("grid_buy_fills", "0"))
+        stats["sell_fills"] = int(self.state.get("grid_sell_fills", "0"))
+        stats["cycles"] = int(self.state.get("grid_cycles", "0"))
+        stats["num_levels"] = len(self.grid_levels)
         return stats

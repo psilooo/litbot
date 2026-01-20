@@ -14,21 +14,61 @@ class OrderSide(Enum):
 
 
 class OrderStatus(Enum):
+    IN_PROGRESS = "in-progress"
     PENDING = "pending"
+    OPEN = "open"
     FILLED = "filled"
-    CANCELLED = "cancelled"
+    CANCELLED = "canceled"  # API uses "canceled" spelling
     PARTIALLY_FILLED = "partially_filled"
+    # Cancellation reasons
+    CANCELED_POST_ONLY = "canceled-post-only"
+    CANCELED_TOO_MUCH_SLIPPAGE = "canceled-too-much-slippage"
+    CANCELED_IOC = "canceled-ioc"
+    CANCELED_FOK = "canceled-fok"
+    CANCELED_REDUCE_ONLY = "canceled-reduce-only"
+    CANCELED_SELF_TRADE = "canceled-self-trade"
+    CANCELED_NOT_ENOUGH_MARGIN = "canceled-not-enough-margin"
+    CANCELED_BY_USER = "canceled-by-user"
+
+    @classmethod
+    def from_value(cls, value):
+        """Convert value to OrderStatus, handling old string values."""
+        # Handle old "cancelled" spelling
+        if value == "cancelled":
+            value = "canceled"
+        return cls(value)
 
 
 class OrderType(Enum):
-    LIMIT = 0
-    MARKET = 1
+    LIMIT = "limit"
+    MARKET = "market"
+    STOP_LOSS = "stop-loss"
+    STOP_LOSS_LIMIT = "stop-loss-limit"
+    TAKE_PROFIT = "take-profit"
+    TAKE_PROFIT_LIMIT = "take-profit-limit"
+
+    @classmethod
+    def from_value(cls, value):
+        """Convert value to OrderType, handling old integer values."""
+        # Map old integer values to new string values
+        int_to_str = {0: "limit", 1: "market", 2: "stop-loss", 3: "stop-loss-limit", 4: "take-profit", 5: "take-profit-limit"}
+        if isinstance(value, int):
+            value = int_to_str.get(value, "limit")
+        return cls(value)
 
 
 class TimeInForce(Enum):
-    IOC = 0  # Immediate or cancel
-    GTC = 1  # Good till time
-    POST_ONLY = 2
+    GTC = "good-till-time"
+    IOC = "immediate-or-cancel"
+    POST_ONLY = "post-only"
+
+    @classmethod
+    def from_value(cls, value):
+        """Convert value to TimeInForce, handling old integer values."""
+        int_to_str = {0: "immediate-or-cancel", 1: "good-till-time", 2: "post-only"}
+        if isinstance(value, int):
+            value = int_to_str.get(value, "good-till-time")
+        return cls(value)
 
 
 class MarketType(Enum):
@@ -55,13 +95,14 @@ class Market:
 @dataclass
 class Order:
     """Order information."""
-    id: str
+    id: str  # order_index from exchange (used for cancellation)
     market_id: int
     side: OrderSide
     price: Decimal
     size: Decimal
     status: OrderStatus
     order_type: OrderType
+    tx_hash: Optional[str] = None  # Transaction hash from order placement
     grid_level: Optional[int] = None
     created_at: datetime = field(default_factory=datetime.now)
     filled_at: Optional[datetime] = None
@@ -79,6 +120,14 @@ class Position:
 
 
 @dataclass
+class AssetBalance:
+    """Spot asset balance."""
+    asset_id: int
+    balance: Decimal  # Available balance
+    locked_balance: Decimal  # In open orders
+
+
+@dataclass
 class Account:
     """Account balance information."""
     index: int
@@ -86,6 +135,8 @@ class Account:
     collateral: Decimal
     available_balance: Decimal
     positions: list[Position] = field(default_factory=list)
+    assets: list[AssetBalance] = field(default_factory=list)  # Spot balances
+    total_asset_value: Decimal = Decimal("0")  # Total portfolio value from exchange
 
 
 @dataclass

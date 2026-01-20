@@ -26,9 +26,61 @@ from lithood.types import OrderSide, MarketType
 from lithood.logger import log
 
 
-SYMBOL = "LIT"
-TEST_SIZE = Decimal("1")  # 1 LIT for tests
+SPOT_SYMBOL = "LIT/USDC"  # Spot markets use pair format
+PERP_SYMBOL = "LIT"       # Perp markets use base asset
+SPOT_TEST_SIZE = Decimal("1")   # 1 LIT for spot (min: 1 LIT, $0.001 notional)
+PERP_TEST_SIZE = Decimal("6")   # 6 LIT for perp (min: 2 LIT, $10 notional)
 PRICE_OFFSET_PCT = Decimal("0.10")  # 10% away from market
+
+
+async def check_proxy_status() -> bool:
+    """Check if proxy is configured and working."""
+    import aiohttp
+    from lithood.config import PROXY_URL
+
+    log.info("=" * 60)
+    log.info("=== PROXY CHECK ===")
+    log.info("=" * 60)
+
+    if not PROXY_URL:
+        log.warning("No proxy configured (PROXY_HOST/PROXY_PORT not set in .env)")
+        log.warning("Requests will use your real IP address")
+        return False
+
+    # Mask credentials in log
+    masked_proxy = PROXY_URL.split("@")[-1] if "@" in PROXY_URL else PROXY_URL
+    log.info(f"Proxy configured: {masked_proxy}")
+
+    # Test proxy by checking our apparent IP
+    try:
+        async with aiohttp.ClientSession() as session:
+            # First get IP without proxy
+            async with session.get("https://api.ipify.org?format=json", timeout=10) as resp:
+                real_ip_data = await resp.json()
+                real_ip = real_ip_data.get("ip", "unknown")
+
+            # Then get IP with proxy
+            async with session.get(
+                "https://api.ipify.org?format=json",
+                proxy=PROXY_URL,
+                timeout=10
+            ) as resp:
+                proxy_ip_data = await resp.json()
+                proxy_ip = proxy_ip_data.get("ip", "unknown")
+
+        log.info(f"Your real IP: {real_ip}")
+        log.info(f"Proxy IP: {proxy_ip}")
+
+        if real_ip == proxy_ip:
+            log.warning("WARNING: Proxy IP matches real IP - proxy may not be working!")
+            return False
+        else:
+            log.info("Proxy is working - IPs are different")
+            return True
+
+    except Exception as e:
+        log.error(f"Proxy check failed: {e}")
+        return False
 
 
 async def test_baseline_state(client: LighterClient) -> dict:
@@ -51,14 +103,20 @@ async def test_baseline_state(client: LighterClient) -> dict:
     log.info(f"Collateral: ${account.collateral}")
     log.info(f"Available balance: ${account.available_balance}")
 
-    # Get open orders count
-    active_orders = await client.get_active_orders()
-    log.info(f"Active orders: {len(active_orders)}")
+    # Get open orders count for the markets we're testing (not all 132!)
+    spot_market = client.get_market(SPOT_SYMBOL, MarketType.SPOT)
+    perp_market = client.get_market(PERP_SYMBOL, MarketType.PERP)
 
-    # Get positions
+    spot_orders = await client.get_active_orders(market_id=spot_market.market_id)
+    perp_orders = await client.get_active_orders(market_id=perp_market.market_id)
+    active_orders = spot_orders + perp_orders
+    log.info(f"Active orders (LIT spot + perp): {len(active_orders)}")
+
+    # Get positions (filter out zero-size)
     positions = await client.get_positions()
-    log.info(f"Open positions: {len(positions)}")
-    for pos in positions:
+    active_positions = [p for p in positions if p.size != 0]
+    log.info(f"Open positions: {len(active_positions)}")
+    for pos in active_positions:
         log.info(f"  Market {pos.market_id}: size={pos.size}, entry={pos.entry_price}")
 
     baseline = {
@@ -88,7 +146,7 @@ async def test_spot_order(client: LighterClient) -> None:
     log.info("=" * 60)
 
     # Get current mid price
-    mid_price = await client.get_mid_price(SYMBOL, MarketType.SPOT)
+    mid_price = await client.get_mid_price(SPOT_SYMBOL, MarketType.SPOT)
     assert mid_price is not None, "Failed to get spot mid price"
     log.info(f"Spot mid price: ${mid_price}")
 
@@ -98,17 +156,17 @@ async def test_spot_order(client: LighterClient) -> None:
     log.info(f"Placing limit buy at ${limit_price} (10% below market)")
 
     # Get spot market info
-    spot_market = client.get_market(SYMBOL, MarketType.SPOT)
+    spot_market = client.get_market(SPOT_SYMBOL, MarketType.SPOT)
     assert spot_market is not None, "Spot market not found"
     spot_market_id = spot_market.market_id
 
     # Place limit order
     order = await client.place_limit_order(
-        symbol=SYMBOL,
+        symbol=SPOT_SYMBOL,
         market_type=MarketType.SPOT,
         side=OrderSide.BUY,
         price=limit_price,
-        size=TEST_SIZE,
+        size=SPOT_TEST_SIZE,
         post_only=True,
     )
     assert order is not None, "Failed to place spot limit order"
@@ -134,7 +192,7 @@ async def test_spot_order(client: LighterClient) -> None:
 
     # Cancel the order
     log.info(f"Cancelling order {our_order.id}...")
-    cancelled = await client.cancel_order(our_order.id)
+    cancelled = await client.cancel_order(our_order.id, market_id=spot_market_id)
     assert cancelled, "Failed to cancel spot order"
     log.info("Order cancelled successfully")
 
@@ -165,17 +223,17 @@ async def test_spot_fill(client: LighterClient, baseline: dict) -> None:
     log.info("=" * 60)
 
     # Get current mid price for reference
-    mid_price = await client.get_mid_price(SYMBOL, MarketType.SPOT)
+    mid_price = await client.get_mid_price(SPOT_SYMBOL, MarketType.SPOT)
     assert mid_price is not None, "Failed to get spot mid price"
     log.info(f"Spot mid price: ${mid_price}")
-    log.info(f"Placing market buy for {TEST_SIZE} LIT (~${TEST_SIZE * mid_price})")
+    log.info(f"Placing market buy for {SPOT_TEST_SIZE} LIT (~${SPOT_TEST_SIZE * mid_price})")
 
     # Place market order
     order = await client.place_market_order(
-        symbol=SYMBOL,
+        symbol=SPOT_SYMBOL,
         market_type=MarketType.SPOT,
         side=OrderSide.BUY,
-        size=TEST_SIZE,
+        size=SPOT_TEST_SIZE,
     )
     assert order is not None, "Failed to place spot market order"
     log.info(f"Market order filled: tx_hash={order.id}")
@@ -212,7 +270,7 @@ async def test_perp_order(client: LighterClient) -> None:
     log.info("=" * 60)
 
     # Get current mid price
-    mid_price = await client.get_mid_price(SYMBOL, MarketType.PERP)
+    mid_price = await client.get_mid_price(PERP_SYMBOL, MarketType.PERP)
     assert mid_price is not None, "Failed to get perp mid price"
     log.info(f"Perp mid price: ${mid_price}")
 
@@ -222,17 +280,17 @@ async def test_perp_order(client: LighterClient) -> None:
     log.info(f"Placing limit sell at ${limit_price} (10% above market)")
 
     # Get perp market info
-    perp_market = client.get_market(SYMBOL, MarketType.PERP)
+    perp_market = client.get_market(PERP_SYMBOL, MarketType.PERP)
     assert perp_market is not None, "Perp market not found"
     perp_market_id = perp_market.market_id
 
     # Place limit order
     order = await client.place_limit_order(
-        symbol=SYMBOL,
+        symbol=PERP_SYMBOL,
         market_type=MarketType.PERP,
         side=OrderSide.SELL,
         price=limit_price,
-        size=TEST_SIZE,
+        size=PERP_TEST_SIZE,
         post_only=True,
     )
     assert order is not None, "Failed to place perp limit order"
@@ -258,7 +316,7 @@ async def test_perp_order(client: LighterClient) -> None:
 
     # Cancel the order
     log.info(f"Cancelling order {our_order.id}...")
-    cancelled = await client.cancel_order(our_order.id)
+    cancelled = await client.cancel_order(our_order.id, market_id=perp_market_id)
     assert cancelled, "Failed to cancel perp order"
     log.info("Order cancelled successfully")
 
@@ -290,12 +348,12 @@ async def test_perp_position(client: LighterClient) -> None:
     log.info("=" * 60)
 
     # Get perp market info
-    perp_market = client.get_market(SYMBOL, MarketType.PERP)
+    perp_market = client.get_market(PERP_SYMBOL, MarketType.PERP)
     assert perp_market is not None, "Perp market not found"
     perp_market_id = perp_market.market_id
 
     # Get current mid price for reference
-    mid_price = await client.get_mid_price(SYMBOL, MarketType.PERP)
+    mid_price = await client.get_mid_price(PERP_SYMBOL, MarketType.PERP)
     assert mid_price is not None, "Failed to get perp mid price"
     log.info(f"Perp mid price: ${mid_price}")
 
@@ -309,12 +367,12 @@ async def test_perp_position(client: LighterClient) -> None:
     log.info(f"Initial position size: {initial_size}")
 
     # Open short position (market sell)
-    log.info(f"Opening short position: {TEST_SIZE} LIT")
+    log.info(f"Opening short position: {PERP_TEST_SIZE} LIT")
     order = await client.place_market_order(
-        symbol=SYMBOL,
+        symbol=PERP_SYMBOL,
         market_type=MarketType.PERP,
         side=OrderSide.SELL,
-        size=TEST_SIZE,
+        size=PERP_TEST_SIZE,
     )
     assert order is not None, "Failed to place perp market sell order"
     log.info(f"Market sell filled: tx_hash={order.id}")
@@ -331,7 +389,7 @@ async def test_perp_position(client: LighterClient) -> None:
     )
     assert position is not None, "Position not found after opening short"
 
-    expected_size = initial_size - TEST_SIZE  # Short = negative
+    expected_size = initial_size - PERP_TEST_SIZE  # Short = negative
     log.info(f"Position size: {position.size} (expected ~{expected_size})")
     log.info(f"Entry price: ${position.entry_price}")
     log.info(f"Unrealized PnL: ${position.unrealized_pnl}")
@@ -341,12 +399,12 @@ async def test_perp_position(client: LighterClient) -> None:
     log.info("Verified short position opened")
 
     # Close position (market buy)
-    log.info(f"Closing short position: {TEST_SIZE} LIT")
+    log.info(f"Closing short position: {PERP_TEST_SIZE} LIT")
     order = await client.place_market_order(
-        symbol=SYMBOL,
+        symbol=PERP_SYMBOL,
         market_type=MarketType.PERP,
         side=OrderSide.BUY,
-        size=TEST_SIZE,
+        size=PERP_TEST_SIZE,
     )
     assert order is not None, "Failed to place perp market buy order"
     log.info(f"Market buy filled: tx_hash={order.id}")
@@ -403,11 +461,15 @@ async def test_final_state(client: LighterClient, baseline: dict) -> None:
 
     # Get final positions
     positions = await client.get_positions()
-    log.info(f"  Final positions: {len(positions)}")
+    active_positions = [p for p in positions if p.size != 0]
+    log.info(f"  Final positions: {len(active_positions)}")
 
-    # Get final active orders
-    active_orders = await client.get_active_orders()
-    log.info(f"  Final active orders: {len(active_orders)}")
+    # Get final active orders (just LIT markets, not all 132)
+    spot_market = client.get_market(SPOT_SYMBOL, MarketType.SPOT)
+    perp_market = client.get_market(PERP_SYMBOL, MarketType.PERP)
+    spot_orders = await client.get_active_orders(market_id=spot_market.market_id)
+    perp_orders = await client.get_active_orders(market_id=perp_market.market_id)
+    log.info(f"  Final active orders (LIT): {len(spot_orders) + len(perp_orders)}")
 
     log.info("")
     log.info("TEST 6 PASSED: Final state captured")
@@ -419,9 +481,18 @@ async def main() -> int:
     log.info("LIGHTER API CONNECTIVITY TEST")
     log.info("=" * 60)
     log.info("")
+
+    # Check proxy status first
+    proxy_working = await check_proxy_status()
+    log.info("")
+
+    if not proxy_working:
+        log.warning("Continuing without working proxy - orders may fail due to geo-restrictions")
+        log.info("")
+
     log.info("This test will verify API connectivity and functionality.")
-    log.info(f"Test size: {TEST_SIZE} LIT per order")
-    log.info(f"Estimated cost: ~$3-4 for market order fees")
+    log.info(f"Test sizes: {SPOT_TEST_SIZE} LIT (spot), {PERP_TEST_SIZE} LIT (perp)")
+    log.info(f"Estimated cost: ~$12 for market order round trips (perp requires $10 min notional)")
     log.info("")
 
     client = LighterClient()
