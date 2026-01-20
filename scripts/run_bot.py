@@ -297,7 +297,7 @@ class LitGridBot:
         grid_pnl = grid_stats.get("total_profit", Decimal("0"))
 
         # Total net worth
-        total_net_worth = lit_value + usdc_spot + usdc_perp
+        total_net_worth = lit_value + usdc_spot
 
         # Order counts
         pending_orders = grid_stats.get("pending_orders", 0)
