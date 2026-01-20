@@ -274,33 +274,21 @@ class LitGridBot:
         lit_asset_id = spot_market.base_asset_id if spot_market else 0
         usdc_asset_id = spot_market.quote_asset_id if spot_market else 0
 
-        # Get actual LIT balance from exchange (available + locked)
+        # Get actual LIT balance from exchange (AVAILABLE ONLY - not locked in orders)
         lit_balance = Decimal("0")
-        lit_available = Decimal("0")
-        lit_locked = Decimal("0")
         if account:
             for asset in account.assets:
                 if asset.asset_id == lit_asset_id:
-                    lit_available = asset.balance
-                    lit_locked = asset.locked_balance
-                    lit_balance = lit_available + lit_locked
+                    lit_balance = asset.balance  # Available only
                     break
 
-        # Get actual USDC balance from exchange (available + locked)
+        # Get actual USDC balance from exchange (AVAILABLE ONLY - not locked in orders)
         usdc_spot = Decimal("0")
-        usdc_available = Decimal("0")
-        usdc_locked = Decimal("0")
         if account:
             for asset in account.assets:
                 if asset.asset_id == usdc_asset_id:
-                    usdc_available = asset.balance
-                    usdc_locked = asset.locked_balance
-                    usdc_spot = usdc_available + usdc_locked
+                    usdc_spot = asset.balance  # Available only
                     break
-
-        # Perp collateral from exchange (if any) - don't add if it's already in spot
-        # Note: Some exchanges count collateral separately, others include it in spot USDC
-        usdc_perp = Decimal("0")  # Disabled to avoid potential double-counting
 
         # LIT value
         lit_value = lit_balance * price
@@ -342,8 +330,8 @@ class LitGridBot:
         print(f"  PRICE: ${price:.4f} ({price_change:+.2f}%)  |  Entry: ${entry_price:.4f}")
         print("-" * 60)
         print(f"  PORTFOLIO")
-        print(f"    LIT:   {lit_available:>10,.2f} avail + {lit_locked:>10,.2f} locked = {lit_balance:>10,.2f} (${lit_value:>10,.2f})")
-        print(f"    USDC:  {usdc_available:>10,.2f} avail + {usdc_locked:>10,.2f} locked = {usdc_spot:>10,.2f}")
+        print(f"    LIT:            {lit_balance:>10,.2f}  (${lit_value:>10,.2f})")
+        print(f"    USDC:           ${usdc_spot:>10,.2f}")
         print(f"    ───────────────────────────────────────")
         print(f"    TOTAL NET:      ${total_net_worth:>12,.2f}")
         print(f"    vs Floor:       ${vs_floor:>12,.2f}  ({vs_floor_pct:+.1f}%)")

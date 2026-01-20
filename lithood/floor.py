@@ -59,29 +59,27 @@ class FloorProtection:
         lit_asset_id = spot_market.base_asset_id
         usdc_asset_id = spot_market.quote_asset_id
 
-        # Get actual LIT balance (available + locked)
+        # Get actual LIT balance (AVAILABLE ONLY - not locked in orders)
         lit_balance = Decimal("0")
         for asset in account.assets:
             if asset.asset_id == lit_asset_id:
-                lit_balance = asset.balance + asset.locked_balance
+                lit_balance = asset.balance  # Available only
                 break
         lit_value = lit_balance * price
 
         # Update state with actual balance for display purposes
         self.state.set("lit_balance", str(lit_balance))
 
-        # Get actual USDC balance (available + locked)
+        # Get actual USDC balance (AVAILABLE ONLY - not locked in orders)
         usdc_balance = Decimal("0")
         for asset in account.assets:
             if asset.asset_id == usdc_asset_id:
-                usdc_balance = asset.balance + asset.locked_balance
+                usdc_balance = asset.balance  # Available only
                 break
 
-        # Note: Don't add perp collateral separately - it may already be included in spot USDC
-        # depending on how the exchange reports balances
         total = lit_value + usdc_balance
 
-        log.debug(f"Portfolio: LIT={lit_balance}(${lit_value:.2f}) + USDC=${usdc_balance:.2f} = ${total:.2f}")
+        log.debug(f"Portfolio: LIT={lit_balance:.2f}(${lit_value:.2f}) + USDC=${usdc_balance:.2f} = ${total:.2f}")
 
         return total
 
