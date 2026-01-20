@@ -70,11 +70,9 @@ PERP_SYMBOL = "LIT"       # Perp market symbol (base asset)
 GRID_CONFIG = {
     "num_buy_levels": 10,
     "num_sell_levels": 10,
-    "total_buy_usdc": Decimal("6500"),      # Total USDC for all buy orders
-    "total_sell_lit": Decimal("4000"),      # Total LIT for all sell orders
+    "lit_per_order": Decimal("400"),        # Fixed 400 LIT per order (both buys and sells)
     "level_spacing_pct": Decimal("0.02"),   # 2% spacing between grid levels
     "cycle_spread_pct": Decimal("0.02"),    # 2% spread when cycling (MUST equal level_spacing)
-    "profit_retention": Decimal("0.02"),    # 2% kept as profit each cycle
 }
 
 
@@ -88,44 +86,38 @@ class GridLevel:
 
 
 def generate_grid_levels(entry_price: Decimal) -> tuple[List[GridLevel], List[GridLevel]]:
-    """Generate grid levels with fixed 2% spacing.
+    """Generate grid levels with fixed 2% spacing and fixed 400 LIT per order.
 
     Returns:
         (buy_levels, sell_levels) - separate lists for each side
     """
     config = GRID_CONFIG
     spacing = config["level_spacing_pct"]
+    lit_per_order = config["lit_per_order"]
 
     # Generate buy levels (below entry) - each level is 2% below the previous
     buy_levels = []
-    usdc_per_level = config["total_buy_usdc"] / config["num_buy_levels"]
-
     for i in range(config["num_buy_levels"]):
-        # Level 1 is 2% below entry, level 2 is 4% below, etc.
         multiplier = (1 - spacing) ** (i + 1)
         price = entry_price * multiplier
-        size = usdc_per_level / price  # LIT amount
 
         buy_levels.append(GridLevel(
             level_id=i + 1,
             price=price.quantize(Decimal("0.0001")),
-            size=size.quantize(Decimal("0.01")),
+            size=lit_per_order,  # Fixed 400 LIT
             side="buy",
         ))
 
     # Generate sell levels (above entry) - each level is 2% above the previous
     sell_levels = []
-    lit_per_level = config["total_sell_lit"] / config["num_sell_levels"]
-
     for i in range(config["num_sell_levels"]):
-        # Level 1 is 2% above entry, level 2 is 4% above, etc.
         multiplier = (1 + spacing) ** (i + 1)
         price = entry_price * multiplier
 
         sell_levels.append(GridLevel(
             level_id=i + 1,
             price=price.quantize(Decimal("0.0001")),
-            size=lit_per_level.quantize(Decimal("0.01")),
+            size=lit_per_order,  # Fixed 400 LIT
             side="sell",
         ))
 
@@ -163,6 +155,7 @@ def generate_grid_pairs(entry_price: Decimal) -> List[GridPair]:
     # Create pairs by matching buy and sell levels
     pairs = []
     spread = GRID_CONFIG["cycle_spread_pct"]
+    lit_per_order = GRID_CONFIG["lit_per_order"]
 
     for i, buy in enumerate(buy_levels):
         sell = sell_levels[i] if i < len(sell_levels) else None
@@ -171,8 +164,8 @@ def generate_grid_pairs(entry_price: Decimal) -> List[GridPair]:
             buy_price=buy.price,
             sell_price=sell.price if sell else buy.price * (1 + spread),
             spread_pct=spread,
-            usdc_size=GRID_CONFIG["total_buy_usdc"] / GRID_CONFIG["num_buy_levels"],
-            lit_size=sell.size if sell else buy.size,  # Use sell level's size for initial sells
+            usdc_size=lit_per_order * buy.price,  # USDC needed for 400 LIT at this price
+            lit_size=lit_per_order,  # Fixed 400 LIT
         ))
 
     return pairs
@@ -180,7 +173,6 @@ def generate_grid_pairs(entry_price: Decimal) -> List[GridPair]:
 
 # Grid Parameters (legacy - for compatibility)
 GRID_SPREAD = Decimal("0.02")  # Must match level_spacing_pct
-GRID_PROFIT_RETAIN = GRID_CONFIG["profit_retention"]
 
 # Hedge Parameters - DISABLED (capital moved to grid buys)
 HEDGE_CONFIG = {

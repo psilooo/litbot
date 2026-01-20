@@ -26,7 +26,7 @@ from lithood.state import StateManager
 from lithood.types import Order, OrderSide, MarketType, OrderStatus
 from lithood.config import (
     generate_grid_pairs, generate_full_grid_ladder, GridPair, GRID_CONFIG,
-    GRID_PROFIT_RETAIN, SPOT_SYMBOL,
+    SPOT_SYMBOL,
 )
 from lithood.logger import log
 
@@ -78,19 +78,19 @@ class GridEngine:
         for level in self.grid_levels:
             log.info(f"  Level {level.pair_id}: Buy ${level.buy_price} / Sell ${level.sell_price}")
 
-        # Place initial orders - buys below entry, sells above entry
+        # Place initial orders - buys below entry, sells above entry (all 400 LIT)
         for level in self.grid_levels:
             if level.buy_price < entry_price:
                 await self._place_grid_buy(
                     price=level.buy_price,
-                    usdc_amount=level.usdc_size,
+                    lit_size=level.lit_size,  # Fixed 400 LIT
                     level_id=level.pair_id
                 )
 
             if level.sell_price > entry_price:
                 await self._place_grid_sell(
                     price=level.sell_price,
-                    lit_amount=level.lit_size,
+                    lit_amount=level.lit_size,  # Fixed 400 LIT
                     level_id=level.pair_id
                 )
 
@@ -147,21 +147,18 @@ class GridEngine:
         log.warning(f"Price ${price} not near any grid level, using as-is")
         return price.quantize(Decimal("0.0001"))
 
-    async def _place_grid_buy(self, price: Decimal, usdc_amount: Decimal, level_id: int = 0) -> Optional[Order]:
-        """Place a grid buy order."""
+    async def _place_grid_buy(self, price: Decimal, lit_size: Decimal, level_id: int = 0) -> Optional[Order]:
+        """Place a grid buy order for a fixed LIT amount."""
         if self.state.get("grid_paused"):
             log.debug(f"Grid paused - skipping buy at ${price}")
             return None
-
-        # Convert USDC amount to LIT size
-        size = usdc_amount / price
 
         order = await self.client.place_limit_order(
             symbol=self.symbol,
             market_type=self.market_type,
             side=OrderSide.BUY,
             price=price,
-            size=size,
+            size=lit_size,
         )
         if order is None:
             log.error(f"Failed to place grid buy at ${price}")
@@ -170,7 +167,7 @@ class GridEngine:
         order.grid_level = level_id
         self.state.save_order(order)
 
-        log.info(f"Grid BUY placed: {size:.2f} LIT @ ${price}")
+        log.info(f"Grid BUY placed: {lit_size:.2f} LIT @ ${price}")
         return order
 
     async def _place_grid_sell(self, price: Decimal, lit_amount: Decimal, level_id: int = 0) -> Optional[Order]:
@@ -300,16 +297,17 @@ class GridEngine:
 
         else:
             # Sell filled -> place buy one level down (2% lower)
+            # Use same LIT size - profit is captured in the price spread
             raw_price = order.price * (1 - CYCLE_SPREAD)
             buy_price = self._snap_to_grid(raw_price)
-            usdc_received = filled_size * order.price
-            usdc_to_reinvest = usdc_received * (1 - GRID_PROFIT_RETAIN)
-            realized_profit = usdc_received * GRID_PROFIT_RETAIN
+
+            # Profit = difference between sell and buy price × size
+            realized_profit = filled_size * (order.price - buy_price)
 
             log.info(f"SELL FILLED @ ${order.price} -> placing buy @ ${buy_price} (next level down)")
-            log.info(f"  Profit retained: ${realized_profit:.2f}")
+            log.info(f"  Spread profit: ${realized_profit:.2f}")
 
-            await self._place_grid_buy(buy_price, usdc_to_reinvest, level_id=level_id)
+            await self._place_grid_buy(buy_price, filled_size, level_id=level_id)  # Same LIT size
 
             # Update profit tracking
             total_profit = Decimal(self.state.get("total_grid_profit", "0"))
