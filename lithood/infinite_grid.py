@@ -186,8 +186,99 @@ class InfiniteGridEngine:
         return order
 
     async def check_fills(self):
-        """Check for fills and cycle orders."""
-        pass  # Implemented in Task 3
+        """Check for filled orders and cycle. Ratchet floor on profitable cycles."""
+        if self.state.get("grid_paused"):
+            return
+
+        market = self.client.get_market(self.symbol, self.market_type)
+        if market is None:
+            log.error(f"Market not found: {self.symbol}_{self.market_type.value}")
+            return
+
+        try:
+            active_orders = await self.client.get_active_orders(market_id=market.market_id)
+        except Exception as e:
+            log.error(f"Failed to get active orders: {e}")
+            return
+
+        active_map = {(o.price, o.side): o for o in active_orders}
+
+        grace_cutoff = datetime.now() - timedelta(seconds=30)
+
+        # Check our pending and partially filled orders
+        # (partially filled orders need continued monitoring for more fills)
+        orders_to_check = (
+            self.state.get_pending_orders()
+            + self.state.get_orders_by_status(OrderStatus.PARTIALLY_FILLED)
+        )
+        for order in orders_to_check:
+            if order.market_id != market.market_id:
+                continue
+            if order.created_at > grace_cutoff:
+                continue
+
+            key = (order.price, order.side)
+            exchange_order = active_map.get(key)
+
+            if exchange_order is None:
+                # Order is no longer active - fully filled
+                await self._on_fill(order, order.size)
+            elif exchange_order.filled_size > order.filled_size:
+                # Order is still active but has new partial fill
+                new_fill_amount = exchange_order.filled_size - order.filled_size
+                log.info(
+                    f"Partial fill detected: {new_fill_amount:.4f} of {order.size:.4f} "
+                    f"@ ${order.price} ({order.side.value})"
+                )
+                # Update local state with new filled amount
+                self.state.mark_partially_filled(order.id, exchange_order.filled_size)
+                # Place counter-order for only the newly filled portion
+                await self._on_fill(order, new_fill_amount)
+
+    async def _on_fill(self, order: Order, filled_size: Decimal):
+        """Handle fill - cycle and possibly ratchet floor."""
+        self.state.mark_filled(order.id, filled_size)
+
+        if self.state.get("grid_paused"):
+            return
+
+        spacing = self.config.level_spacing_pct
+
+        if order.side == OrderSide.BUY:
+            # Buy filled -> sell 2% higher
+            sell_price = (order.price * (1 + spacing)).quantize(Decimal("0.0001"))
+            log.info(f"BUY FILLED @ ${order.price} -> sell @ ${sell_price}")
+            await self._place_grid_sell(sell_price)
+
+            fills = int(self.state.get("infinite_grid_buy_fills", "0"))
+            self.state.set("infinite_grid_buy_fills", str(fills + 1))
+
+        else:
+            # Sell filled -> buy 2% lower
+            buy_price = (order.price * (1 - spacing)).quantize(Decimal("0.0001"))
+            profit = filled_size * order.price * spacing  # Approximate profit
+
+            log.info(f"SELL FILLED @ ${order.price} -> buy @ ${buy_price} (profit ~${profit:.2f})")
+            await self._place_grid_buy(buy_price)
+
+            # RATCHET THE FLOOR UP
+            # Each profitable sell cycle means we can raise our floor
+            new_floor = (self._sell_floor * (1 + spacing)).quantize(Decimal("0.0001"))
+            if new_floor > self._sell_floor:
+                log.info(f"FLOOR RATCHET: ${self._sell_floor} -> ${new_floor}")
+                self._sell_floor = new_floor
+                self.state.set("infinite_grid_sell_floor", str(self._sell_floor))
+
+            # Update profit tracking
+            total_profit = Decimal(self.state.get("infinite_grid_profit", "0"))
+            total_profit += profit
+            self.state.set("infinite_grid_profit", str(total_profit))
+
+            fills = int(self.state.get("infinite_grid_sell_fills", "0"))
+            self.state.set("infinite_grid_sell_fills", str(fills + 1))
+
+            cycles = int(self.state.get("infinite_grid_cycles", "0"))
+            self.state.set("infinite_grid_cycles", str(cycles + 1))
 
     async def _maybe_recenter(self, current_price: Decimal):
         """Check if grid needs recentering."""
