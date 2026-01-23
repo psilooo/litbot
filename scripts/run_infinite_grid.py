@@ -4,8 +4,8 @@
 
 This bot uses an adaptive grid that:
 1. Re-centers when price reaches the edge
-2. Uses a trailing floor to prevent selling all LIT early
-3. Ratchets the floor up with each profitable cycle
+2. Captures volatility through continuous buy/sell cycling
+3. No floor - grid cycles freely at all price levels
 """
 
 import asyncio
@@ -57,8 +57,8 @@ class InfiniteGridBot:
         config = InfiniteGridConfig(
             num_levels=15,
             level_spacing_pct=Decimal("0.02"),
-            lit_per_order=Decimal("400"),
-            total_grid_lit=Decimal("16000"),
+            lit_per_order=Decimal("350"),
+            total_grid_lit=Decimal("15000"),
             recenter_threshold=2,
         )
 
@@ -135,12 +135,12 @@ class InfiniteGridBot:
 
     async def _print_status(self, price: Decimal):
         """Print status."""
-        floor = Decimal(self.state.get("infinite_grid_sell_floor", "0"))
         cycles = int(self.state.get("infinite_grid_cycles", "0"))
         profit = Decimal(self.state.get("infinite_grid_profit", "0"))
         recenters = int(self.state.get("infinite_grid_recenters", "0"))
         buy_fills = int(self.state.get("infinite_grid_buy_fills", "0"))
         sell_fills = int(self.state.get("infinite_grid_sell_fills", "0"))
+        center = Decimal(self.state.get("infinite_grid_center", "0"))
 
         runtime = ""
         if self._start_time:
@@ -153,8 +153,8 @@ class InfiniteGridBot:
         print("=" * 60)
         print(f"  INFINITE GRID | {datetime.now().strftime('%H:%M:%S')} | Runtime: {runtime}")
         print("=" * 60)
-        print(f"  PRICE: ${price:.4f}")
-        print(f"  FLOOR: ${floor:.4f} (sells never below this)")
+        print(f"  PRICE:  ${price:.4f}")
+        print(f"  CENTER: ${center:.4f}")
         print("-" * 60)
         print(f"  Cycles:     {cycles:>6}")
         print(f"  Buy fills:  {buy_fills:>6}")

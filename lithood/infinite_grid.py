@@ -4,9 +4,8 @@
 DESIGN:
 -------
 - Grid re-centers when price reaches top or bottom level
-- Trailing sell floor prevents selling all LIT in a rally
-- Floor ratchets up with each profitable cycle
 - No core sells - all capital in the cycling grid
+- Captures volatility through continuous buy/sell cycling
 """
 
 from datetime import datetime, timedelta
@@ -26,7 +25,7 @@ class InfiniteGridConfig:
         self,
         num_levels: int = 15,  # levels per side (more than original 10)
         level_spacing_pct: Decimal = Decimal("0.02"),
-        lit_per_order: Decimal = Decimal("400"),
+        lit_per_order: Decimal = Decimal("350"),
         total_grid_lit: Decimal = Decimal("16000"),  # All LIT for grid (no core)
         recenter_threshold: int = 2,  # Recenter when within N levels of edge
     ):
@@ -51,10 +50,9 @@ class InfiniteGridEngine:
         self._grid_center: Decimal = Decimal("0")
         self._buy_levels: List[Decimal] = []
         self._sell_levels: List[Decimal] = []
-        self._sell_floor: Decimal = Decimal("0")  # Trailing floor
 
     async def initialize(self):
-        """Initialize grid centered on current price with trailing floor."""
+        """Initialize grid centered on current price."""
         entry_price = await self.client.get_mid_price(self.symbol, self.market_type)
         if entry_price is None:
             log.error("Failed to get mid price - cannot initialize infinite grid")
@@ -69,18 +67,7 @@ class InfiniteGridEngine:
 
         self._grid_center = entry_price
 
-        # Initialize sell floor at current price (will ratchet up)
-        stored_floor = self.state.get("infinite_grid_sell_floor")
-        if stored_floor:
-            self._sell_floor = Decimal(stored_floor)
-            # Floor should never be below current price on fresh start
-            if self._sell_floor < entry_price:
-                self._sell_floor = entry_price
-        else:
-            self._sell_floor = entry_price
-        self.state.set("infinite_grid_sell_floor", str(self._sell_floor))
-
-        log.info(f"Initializing infinite grid. Center: ${entry_price}, Floor: ${self._sell_floor}")
+        log.info(f"Initializing infinite grid. Center: ${entry_price}")
 
         # Generate levels
         self._generate_levels(entry_price)
@@ -101,19 +88,14 @@ class InfiniteGridEngine:
             price = center * ((1 - spacing) ** i)
             self._buy_levels.append(price.quantize(Decimal("0.0001")))
 
-        # Generate sell levels (above center, respecting floor)
+        # Generate sell levels (above center)
         self._sell_levels = []
         for i in range(1, self.config.num_levels + 1):
             price = center * ((1 + spacing) ** i)
             price = price.quantize(Decimal("0.0001"))
-            # Only add if above sell floor
-            if price >= self._sell_floor:
-                self._sell_levels.append(price)
+            self._sell_levels.append(price)
 
         log.info(f"Generated {len(self._buy_levels)} buy levels, {len(self._sell_levels)} sell levels")
-
-        if not self._sell_levels:
-            log.warning(f"No sell levels generated - floor ${self._sell_floor} may be too high")
 
     async def _place_initial_orders(self, center: Decimal):
         """Place buy and sell orders."""
@@ -161,13 +143,8 @@ class InfiniteGridEngine:
         return order
 
     async def _place_grid_sell(self, price: Decimal) -> Optional[Order]:
-        """Place a grid sell order (respects floor)."""
+        """Place a grid sell order."""
         if self.state.get("grid_paused"):
-            return None
-
-        # Enforce sell floor
-        if price < self._sell_floor:
-            log.debug(f"Skipping sell at ${price} - below floor ${self._sell_floor}")
             return None
 
         order = await self.client.place_limit_order(
@@ -236,7 +213,7 @@ class InfiniteGridEngine:
                 await self._on_fill(order, new_fill_amount)
 
     async def _on_fill(self, order: Order, filled_size: Decimal):
-        """Handle fill - cycle and possibly ratchet floor."""
+        """Handle fill - place counter-order."""
         self.state.mark_filled(order.id, filled_size)
 
         if self.state.get("grid_paused"):
@@ -260,14 +237,6 @@ class InfiniteGridEngine:
 
             log.info(f"SELL FILLED @ ${order.price} -> buy @ ${buy_price} (profit ~${profit:.2f})")
             await self._place_grid_buy(buy_price)
-
-            # RATCHET THE FLOOR UP
-            # Each profitable sell cycle means we can raise our floor
-            new_floor = (self._sell_floor * (1 + spacing)).quantize(Decimal("0.0001"))
-            if new_floor > self._sell_floor:
-                log.info(f"FLOOR RATCHET: ${self._sell_floor} -> ${new_floor}")
-                self._sell_floor = new_floor
-                self.state.set("infinite_grid_sell_floor", str(self._sell_floor))
 
             # Update profit tracking
             total_profit = Decimal(self.state.get("infinite_grid_profit", "0"))
@@ -325,7 +294,7 @@ class InfiniteGridEngine:
         recenters = int(self.state.get("infinite_grid_recenters", "0"))
         self.state.set("infinite_grid_recenters", str(recenters + 1))
 
-        log.info(f"Grid recentered. New center: ${new_center}, Floor: ${self._sell_floor}")
+        log.info(f"Grid recentered. New center: ${new_center}")
 
     def pause(self):
         """Pause grid trading."""
@@ -346,7 +315,6 @@ class InfiniteGridEngine:
         """Get grid statistics."""
         return {
             "center": self._grid_center,
-            "sell_floor": self._sell_floor,
             "buy_levels": len(self._buy_levels),
             "sell_levels": len(self._sell_levels),
             "cycles": int(self.state.get("infinite_grid_cycles", "0")),
