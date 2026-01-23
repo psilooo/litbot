@@ -280,6 +280,49 @@ class InfiniteGridEngine:
             cycles = int(self.state.get("infinite_grid_cycles", "0"))
             self.state.set("infinite_grid_cycles", str(cycles + 1))
 
-    async def _maybe_recenter(self, current_price: Decimal):
-        """Check if grid needs recentering."""
-        pass  # Implemented in Task 4
+    async def check_and_recenter(self, current_price: Decimal):
+        """Check if price has reached grid edge and recenter if needed."""
+        if not self._buy_levels or not self._sell_levels:
+            return
+
+        threshold = self.config.recenter_threshold
+
+        # Ensure threshold doesn't exceed list length
+        if threshold <= 0:
+            return
+        sell_threshold = min(threshold, len(self._sell_levels))
+        buy_threshold = min(threshold, len(self._buy_levels))
+
+        # Near top? (price approaching highest sell)
+        if current_price >= self._sell_levels[-sell_threshold]:
+            log.info(f"Price ${current_price} near top of grid - recentering")
+            await self._recenter(current_price)
+            return
+
+        # Near bottom? (price approaching lowest buy)
+        if current_price <= self._buy_levels[-buy_threshold]:
+            log.info(f"Price ${current_price} near bottom of grid - recentering")
+            await self._recenter(current_price)
+            return
+
+    async def _recenter(self, new_center: Decimal):
+        """Cancel all orders and rebuild grid around new center."""
+        log.info(f"RECENTERING grid from ${self._grid_center} to ${new_center}")
+
+        # Cancel all existing orders
+        await self._clear_all_grid_orders()
+
+        # Update center
+        self._grid_center = new_center
+        self.state.set("infinite_grid_center", str(new_center))
+
+        # Regenerate levels (floor is preserved)
+        self._generate_levels(new_center)
+
+        # Place new orders
+        await self._place_initial_orders(new_center)
+
+        recenters = int(self.state.get("infinite_grid_recenters", "0"))
+        self.state.set("infinite_grid_recenters", str(recenters + 1))
+
+        log.info(f"Grid recentered. New center: ${new_center}, Floor: ${self._sell_floor}")
