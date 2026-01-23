@@ -326,3 +326,31 @@ class InfiniteGridEngine:
         self.state.set("infinite_grid_recenters", str(recenters + 1))
 
         log.info(f"Grid recentered. New center: ${new_center}, Floor: ${self._sell_floor}")
+
+    def pause(self):
+        """Pause grid trading."""
+        self.state.set("grid_paused", True)
+        log.warning("Infinite grid PAUSED")
+
+    def resume(self):
+        """Resume grid trading."""
+        self.state.set("grid_paused", False)
+        log.info("Infinite grid RESUMED")
+
+    async def cancel_all(self) -> int:
+        """Cancel all grid orders."""
+        await self._clear_all_grid_orders()
+        return 0  # Count handled in _clear_all_grid_orders
+
+    def get_stats(self) -> dict:
+        """Get grid statistics."""
+        return {
+            "center": self._grid_center,
+            "sell_floor": self._sell_floor,
+            "buy_levels": len(self._buy_levels),
+            "sell_levels": len(self._sell_levels),
+            "cycles": int(self.state.get("infinite_grid_cycles", "0")),
+            "profit": Decimal(self.state.get("infinite_grid_profit", "0")),
+            "recenters": int(self.state.get("infinite_grid_recenters", "0")),
+            "paused": self.state.get("grid_paused", False),
+        }
