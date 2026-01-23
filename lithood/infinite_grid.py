@@ -54,8 +54,136 @@ class InfiniteGridEngine:
         self._sell_floor: Decimal = Decimal("0")  # Trailing floor
 
     async def initialize(self):
-        """Initialize grid centered on current price."""
-        pass  # Implemented in Task 2
+        """Initialize grid centered on current price with trailing floor."""
+        entry_price = await self.client.get_mid_price(self.symbol, self.market_type)
+        if entry_price is None:
+            log.error("Failed to get mid price - cannot initialize infinite grid")
+            return
+
+        # Clear stale orders
+        await self._clear_all_grid_orders()
+
+        if self.state.get("grid_paused"):
+            log.warning("Grid is paused - skipping initialization")
+            return
+
+        self._grid_center = entry_price
+
+        # Initialize sell floor at current price (will ratchet up)
+        stored_floor = self.state.get("infinite_grid_sell_floor")
+        if stored_floor:
+            self._sell_floor = Decimal(stored_floor)
+            # Floor should never be below current price on fresh start
+            if self._sell_floor < entry_price:
+                self._sell_floor = entry_price
+        else:
+            self._sell_floor = entry_price
+        self.state.set("infinite_grid_sell_floor", str(self._sell_floor))
+
+        log.info(f"Initializing infinite grid. Center: ${entry_price}, Floor: ${self._sell_floor}")
+
+        # Generate levels
+        self._generate_levels(entry_price)
+
+        # Place orders
+        await self._place_initial_orders(entry_price)
+
+        self.state.set("infinite_grid_center", str(entry_price))
+        log.info("Infinite grid initialized")
+
+    def _generate_levels(self, center: Decimal):
+        """Generate buy and sell price levels around center."""
+        spacing = self.config.level_spacing_pct
+
+        # Generate buy levels (below center)
+        self._buy_levels = []
+        for i in range(1, self.config.num_levels + 1):
+            price = center * ((1 - spacing) ** i)
+            self._buy_levels.append(price.quantize(Decimal("0.0001")))
+
+        # Generate sell levels (above center, respecting floor)
+        self._sell_levels = []
+        for i in range(1, self.config.num_levels + 1):
+            price = center * ((1 + spacing) ** i)
+            price = price.quantize(Decimal("0.0001"))
+            # Only add if above sell floor
+            if price >= self._sell_floor:
+                self._sell_levels.append(price)
+
+        log.info(f"Generated {len(self._buy_levels)} buy levels, {len(self._sell_levels)} sell levels")
+
+        if not self._sell_levels:
+            log.warning(f"No sell levels generated - floor ${self._sell_floor} may be too high")
+
+    async def _place_initial_orders(self, center: Decimal):
+        """Place buy and sell orders."""
+        for price in self._buy_levels:
+            await self._place_grid_buy(price)
+
+        for price in self._sell_levels:
+            await self._place_grid_sell(price)
+
+    async def _clear_all_grid_orders(self):
+        """Cancel all orders on the exchange."""
+        market = self.client.get_market(self.symbol, self.market_type)
+        if market is None:
+            return
+        try:
+            cancelled = await self.client.cancel_all_orders(market_id=market.market_id)
+            if cancelled > 0:
+                log.info(f"Cancelled {cancelled} orders during grid initialization")
+        except Exception as e:
+            log.warning(f"Failed to cancel orders: {e}")
+
+        # Clear local state
+        for order in self.state.get_pending_orders():
+            if order.market_id == market.market_id:
+                self.state.mark_cancelled(order.id)
+
+    async def _place_grid_buy(self, price: Decimal) -> Optional[Order]:
+        """Place a grid buy order."""
+        if self.state.get("grid_paused"):
+            return None
+
+        order = await self.client.place_limit_order(
+            symbol=self.symbol,
+            market_type=self.market_type,
+            side=OrderSide.BUY,
+            price=price,
+            size=self.config.lit_per_order,
+        )
+        if order is None:
+            log.error(f"Failed to place grid buy at ${price}")
+            return None
+
+        self.state.save_order(order)
+        log.info(f"INF-GRID BUY: {self.config.lit_per_order} LIT @ ${price}")
+        return order
+
+    async def _place_grid_sell(self, price: Decimal) -> Optional[Order]:
+        """Place a grid sell order (respects floor)."""
+        if self.state.get("grid_paused"):
+            return None
+
+        # Enforce sell floor
+        if price < self._sell_floor:
+            log.debug(f"Skipping sell at ${price} - below floor ${self._sell_floor}")
+            return None
+
+        order = await self.client.place_limit_order(
+            symbol=self.symbol,
+            market_type=self.market_type,
+            side=OrderSide.SELL,
+            price=price,
+            size=self.config.lit_per_order,
+        )
+        if order is None:
+            log.error(f"Failed to place grid sell at ${price}")
+            return None
+
+        self.state.save_order(order)
+        log.info(f"INF-GRID SELL: {self.config.lit_per_order} LIT @ ${price}")
+        return order
 
     async def check_fills(self):
         """Check for fills and cycle orders."""
