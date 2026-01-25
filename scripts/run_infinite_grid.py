@@ -8,6 +8,7 @@ This bot uses an adaptive grid that:
 3. No floor - grid cycles freely at all price levels
 """
 
+import argparse
 import asyncio
 import os
 import signal
@@ -31,7 +32,7 @@ from lithood.retry import RETRY_PERSISTENT, calculate_delay
 class InfiniteGridBot:
     """Infinite grid bot - no core sells, all capital cycling."""
 
-    def __init__(self):
+    def __init__(self, amount: Decimal = Decimal("350"), levels: int = 15):
         self.client = LighterClient()
         db_path = os.getenv("BOT_STATE_DB", os.path.join(os.path.dirname(__file__), "..", "infinite_grid_state.db"))
         self.state = StateManager(db_path=db_path)
@@ -41,6 +42,8 @@ class InfiniteGridBot:
         self._stopped = False
         self._start_time = None
         self._consecutive_failures = 0
+        self._amount = amount
+        self._levels = levels
 
     async def start(self):
         """Initialize and start the bot."""
@@ -49,16 +52,17 @@ class InfiniteGridBot:
         log.info("=" * 60)
         log.info("  INFINITE GRID BOT")
         log.info("  Maximum volatility capture")
+        log.info(f"  Amount: {self._amount} LIT | Levels: {self._levels}")
         log.info("=" * 60)
 
         await self.client.connect()
 
         # Configure grid - all available LIT for cycling
         config = InfiniteGridConfig(
-            num_levels=15,
+            num_levels=self._levels,
             level_spacing_pct=Decimal("0.02"),
-            lit_per_order=Decimal("350"),
-            total_grid_lit=Decimal("15000"),
+            lit_per_order=self._amount,
+            total_grid_lit=self._amount * self._levels * 2,
             recenter_threshold=2,
         )
 
@@ -181,8 +185,29 @@ class InfiniteGridBot:
         log.info("Bot stopped")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Infinite Grid Bot")
+    parser.add_argument(
+        "--amount",
+        type=float,
+        default=350,
+        help="LIT per order (default: 350)"
+    )
+    parser.add_argument(
+        "--levels",
+        type=int,
+        default=15,
+        help="Number of buy/sell levels (default: 15)"
+    )
+    return parser.parse_args()
+
+
 async def main():
-    bot = InfiniteGridBot()
+    args = parse_args()
+    bot = InfiniteGridBot(
+        amount=Decimal(str(args.amount)),
+        levels=args.levels
+    )
     stop_requested = False
 
     def request_stop():

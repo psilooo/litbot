@@ -4,14 +4,14 @@ __version__ = "0.1.0"
 
 from lithood.client import LighterClient
 from lithood.state import StateManager
-from lithood.grid import GridEngine
+from lithood.infinite_grid import InfiniteGridEngine
 from lithood.hedge import HedgeManager
 from lithood.floor import FloorProtection
 
 __all__ = [
     "LighterClient",
     "StateManager",
-    "GridEngine",
+    "InfiniteGridEngine",
     "HedgeManager",
     "FloorProtection",
 ]
