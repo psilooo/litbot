@@ -15,7 +15,7 @@ LIGHTER_PRIVATE_KEY = os.getenv("LIGHTER_PRIVATE_KEY", "")  # Wallet key (for se
 LIGHTER_API_KEY_PRIVATE = os.getenv("LIGHTER_API_KEY_PRIVATE", "")  # API key (for trading)
 LIGHTER_API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "3"))  # API key slot (3-254)
 LIGHTER_ACCOUNT_INDEX = os.getenv("LIGHTER_ACCOUNT_INDEX", "")  # Your account index
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # Proxy Configuration

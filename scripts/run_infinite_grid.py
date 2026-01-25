@@ -22,7 +22,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from lithood.client import LighterClient
 from lithood.state import StateManager
 from lithood.infinite_grid import InfiniteGridEngine, InfiniteGridConfig
-from lithood.floor import FloorProtection
 from lithood.types import MarketType
 from lithood.config import POLL_INTERVAL_SECONDS, SPOT_SYMBOL
 from lithood.logger import log
@@ -37,7 +36,6 @@ class InfiniteGridBot:
         db_path = os.getenv("BOT_STATE_DB", os.path.join(os.path.dirname(__file__), "..", "infinite_grid_state.db"))
         self.state = StateManager(db_path=db_path)
         self.grid: InfiniteGridEngine = None
-        self.floor: FloorProtection = None
         self._running = False
         self._stopped = False
         self._start_time = None
@@ -67,8 +65,6 @@ class InfiniteGridBot:
         )
 
         self.grid = InfiniteGridEngine(self.client, self.state, config)
-        # Floor protection without hedge
-        self.floor = FloorProtection(self.client, self.state, self.grid, hedge=None)
 
         await self._sync_state()
         await self.grid.initialize()
@@ -98,10 +94,6 @@ class InfiniteGridBot:
 
         while self._running:
             try:
-                if self.state.get("bot_halted"):
-                    log.info("Bot halted by floor protection")
-                    break
-
                 if self._consecutive_failures >= 3:
                     if not await self.client.ensure_connected():
                         delay = calculate_delay(self._consecutive_failures, RETRY_PERSISTENT)
@@ -119,7 +111,6 @@ class InfiniteGridBot:
                 self._consecutive_failures = 0
 
                 # Core loop
-                await self.floor.check(current_price)
                 await self.grid.check_fills()
                 await self.grid.check_and_recenter(current_price)
 
