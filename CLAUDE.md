@@ -4,83 +4,97 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LIT Grid Trading Bot - an automated trading system for the Lighter DEX platform combining:
+LIT Grid Trading Bot - an automated trading system for the Lighter DEX platform:
 1. **Spot grid trading** - volatility extraction through buy/sell cycling
-2. **Funding yield farming** - delta-neutral short position earning positive funding
-3. **Floor protection** - tiered de-risk system to guarantee $25k minimum
+2. **Floor protection** - value-based system to guarantee $25k minimum
+3. **Core position sells** - upside capture at premium prices
 
-**Current Status:** Strategy specification complete. Ready for implementation.
+**Current Status:** Implemented and running.
 
 ## Key Files
 
-- `summary.md` - Complete strategy specification with all parameters
-- `lighter_api_full.json` - Lighter API OpenAPI documentation (34MB, 59 endpoints)
+- `lithood/config.py` - All strategy parameters (grid, allocation, targets)
+- `lithood/grid.py` - Grid trading engine with fixed-level cycling
+- `lithood/floor.py` - Floor protection system
+- `lithood/client.py` - Lighter API client
+- `lithood/state.py` - State persistence (SQLite)
+- `scripts/run_bot.py` - Main entry point
 
 ## Position & Constraints
 
 | Metric | Value |
 |--------|-------|
-| Starting capital | $36,154 (17,175 LIT + $7,300 USDC) |
 | Hard floor | $25,000 |
 | Target exit | $75,000 |
-| Current price | $1.68 |
 
 ## Strategy Summary
 
-### Three Profit Engines
-1. **Spot Grid:** 8 buy levels ($1.48-$1.655), 8 sell levels ($1.705-$1.88), 1.5% spreads
-2. **Hedge + Funding:** 3,000 LIT short for downside protection + 10-50% APY funding
-3. **Core Position:** 8,000 LIT held for upside capture at $2.50-$4.50+
+### Two Profit Engines
+1. **Spot Grid:** 10 buy + 10 sell levels, 2% spacing, 400 LIT per order
+2. **Core Position:** 11,175 LIT with sells at $2.00-$4.50
 
-### Hedge Details
-- Short 3,000 LIT perp (reduces net exposure from 17,175 to 14,175 LIT)
-- Stop-loss at $1.95 (max loss $810)
-- Re-entry at $1.75 after 24h cooldown
-- Moves floor breach from $1.03 to $0.89 (14% more room)
+### Hedge Status
+**DISABLED** - Hedge is turned off for ranging market conditions to avoid repeated stop-outs.
 
 ### Capital Allocation
-- Core (never grid): 8,000 LIT
+- Core LIT: 11,175 (sells at premium prices)
 - Grid sell: 5,000 LIT
-- Reserve: 4,175 LIT
-- Grid buy: $5,000 USDC
-- Funding margin: $1,500 USDC
+- Reserve: 1,000 LIT (moonbag - no sell orders)
+- Grid buy: $6,500 USDC
+- Hedge margin: $0 USDC (disabled)
 - Cash reserve: $800 USDC
 
-### Floor Protection Tiers
-| Price | Action |
-|-------|--------|
-| $1.50 | Pause grid buys |
-| $1.40 | Sell 2,000 reserve LIT |
-| $1.30 | Sell 2,175 reserve LIT |
-| $1.20 | Cancel grid, sell 3,000 LIT |
-| $1.10 | Exit all to guarantee $25k |
+### Grid Configuration
+- **Levels:** 10 buy + 10 sell
+- **Spacing:** 2% between levels
+- **Cycle spread:** 2% (matches spacing to prevent drift)
+- **Order size:** Fixed 400 LIT per order (both buys and sells)
+- **Snapping:** Counter-orders snap to nearest grid level
+
+### Core Sell Targets
+| Price | LIT |
+|-------|-----|
+| $2.00 | 1,500 |
+| $2.25 | 1,675 |
+| $2.50 | 1,000 |
+| $3.00 | 1,500 |
+| $3.50 | 2,000 |
+| $4.00 | 2,000 |
+| $4.50 | 1,500 |
+
+### Floor Protection
+- **Value-based:** Triggers at $25,500 portfolio value (emergency buffer)
+- **Hard floor:** $25,000
 
 ## Platform Characteristics
 
 - **Zero trading fees** (spot and perp)
 - **Hourly funding rate** (not 8-hour)
-- **Funding typically positive:** 10-50% APY (longs pay shorts)
 - **High volatility:** ±0.5% average hourly candle
 
-## Architecture (Planned)
+## Architecture
 
 ```
-bot/
-├── config/          # Grid levels, risk parameters
-├── core/            # Grid engine, funding manager, state tracker
-├── api/             # Lighter API client, websocket handler
-├── risk/            # Floor protection, delta monitor
-├── utils/           # Logger, state persistence
-└── tests/
+lithood/
+├── config.py        # Grid levels, risk parameters, allocation
+├── grid.py          # Grid engine with fixed-level cycling
+├── floor.py         # Floor protection system
+├── hedge.py         # Hedge manager (currently disabled)
+├── client.py        # Lighter API client
+├── state.py         # SQLite state persistence
+├── types.py         # Order, Position, Market types
+├── logger.py        # Logging configuration
+└── retry.py         # API retry logic
+
+scripts/
+└── run_bot.py       # Main entry point
 ```
 
-## Key Technical Requirements
+## Key Technical Details
 
-1. **WebSocket connection** for real-time fill detection and price monitoring
-2. **Auto-cycling logic:** buy fill → place sell, sell fill → place buy
-3. **Hedge management:**
-   - Open 3k LIT short on startup
-   - Stop-loss at $1.95
-   - Re-entry at $1.75 after 24h cooldown
-4. **Floor protection:** automatic tier execution on price triggers
-5. **State persistence:** survive restarts, reconcile with exchange state
+1. **Fill detection:** Polling-based (no websocket) with 30s grace period for new orders
+2. **Auto-cycling:** Buy fill → sell 2% higher, sell fill → buy 2% lower
+3. **Grid snapping:** Counter-orders snap to predefined grid levels (prevents drift)
+4. **Fixed sizing:** All grid orders are exactly 400 LIT
+5. **Profit capture:** Profit comes from 2% price spread, not position size reduction
+6. **State persistence:** SQLite database survives restarts
