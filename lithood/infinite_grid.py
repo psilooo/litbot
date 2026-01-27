@@ -8,6 +8,7 @@ DESIGN:
 - Captures volatility through continuous buy/sell cycling
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, Set, List
@@ -178,7 +179,10 @@ class InfiniteGridEngine:
             log.error(f"Failed to get active orders: {e}")
             return
 
-        active_map = {(o.price, o.side): o for o in active_orders}
+        # Use order ID for matching (fixes map collision when multiple orders at same price/side)
+        active_by_id = {o.id: o for o in active_orders}
+        # Keep price/side map as fallback for orders placed before this fix
+        active_by_price_side = {(o.price, o.side): o for o in active_orders}
 
         grace_cutoff = datetime.now() - timedelta(seconds=30)
 
@@ -194,12 +198,14 @@ class InfiniteGridEngine:
             if order.created_at > grace_cutoff:
                 continue
 
-            key = (order.price, order.side)
-            exchange_order = active_map.get(key)
+            # Try ID match first, fall back to price/side for backward compatibility
+            exchange_order = active_by_id.get(order.id)
+            if exchange_order is None:
+                exchange_order = active_by_price_side.get((order.price, order.side))
 
             if exchange_order is None:
                 # Order is no longer active - fully filled
-                await self._on_fill(order, order.size)
+                await self._on_full_fill(order)
             elif exchange_order.filled_size > order.filled_size:
                 # Order is still active but has new partial fill
                 new_fill_amount = exchange_order.filled_size - order.filled_size
@@ -207,25 +213,43 @@ class InfiniteGridEngine:
                     f"Partial fill detected: {new_fill_amount:.4f} of {order.size:.4f} "
                     f"@ ${order.price} ({order.side.value})"
                 )
-                # Update local state with new filled amount
+                # Update local state with new filled amount (keep as PARTIALLY_FILLED)
                 self.state.mark_partially_filled(order.id, exchange_order.filled_size)
                 # Place counter-order for only the newly filled portion
-                await self._on_fill(order, new_fill_amount)
+                await self._place_counter_order(order, new_fill_amount)
 
-    async def _on_fill(self, order: Order, filled_size: Decimal):
-        """Handle fill - place counter-order."""
-        self.state.mark_filled(order.id, filled_size)
+    async def _on_full_fill(self, order: Order):
+        """Handle full fill - mark filled and place counter-order."""
+        # Mark the order as fully filled
+        self.state.mark_filled(order.id, order.size)
 
+        # Place counter-order for the full size
+        await self._place_counter_order(order, order.size)
+
+    async def _place_counter_order(self, order: Order, filled_size: Decimal, retry_count: int = 0):
+        """Place counter-order for a fill. Retries on failure to prevent order loss."""
         if self.state.get("grid_paused"):
             return
 
         spacing = self.config.level_spacing_pct
+        max_retries = 3
 
         if order.side == OrderSide.BUY:
             # Buy filled -> sell 2% higher
             sell_price = (order.price * (1 + spacing)).quantize(Decimal("0.0001"))
-            log.info(f"BUY FILLED @ ${order.price} -> sell @ ${sell_price}")
-            await self._place_grid_sell(sell_price)
+            log.info(f"BUY FILLED @ ${order.price} ({filled_size} LIT) -> sell @ ${sell_price}")
+            counter_order = await self._place_grid_sell(sell_price)
+
+            if counter_order is None:
+                if retry_count < max_retries:
+                    log.warning(f"Counter-order failed, retrying ({retry_count + 1}/{max_retries})...")
+                    await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+                    await self._place_counter_order(order, filled_size, retry_count + 1)
+                    return
+                else:
+                    log.error(f"CRITICAL: Failed to place counter SELL after {max_retries} retries! "
+                              f"Order lost at ${sell_price}")
+                    return
 
             fills = int(self.state.get("infinite_grid_buy_fills", "0"))
             self.state.set("infinite_grid_buy_fills", str(fills + 1))
@@ -235,8 +259,19 @@ class InfiniteGridEngine:
             buy_price = (order.price * (1 - spacing)).quantize(Decimal("0.0001"))
             profit = filled_size * order.price * spacing  # Approximate profit
 
-            log.info(f"SELL FILLED @ ${order.price} -> buy @ ${buy_price} (profit ~${profit:.2f})")
-            await self._place_grid_buy(buy_price)
+            log.info(f"SELL FILLED @ ${order.price} ({filled_size} LIT) -> buy @ ${buy_price} (profit ~${profit:.2f})")
+            counter_order = await self._place_grid_buy(buy_price)
+
+            if counter_order is None:
+                if retry_count < max_retries:
+                    log.warning(f"Counter-order failed, retrying ({retry_count + 1}/{max_retries})...")
+                    await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+                    await self._place_counter_order(order, filled_size, retry_count + 1)
+                    return
+                else:
+                    log.error(f"CRITICAL: Failed to place counter BUY after {max_retries} retries! "
+                              f"Order lost at ${buy_price}")
+                    return
 
             # Update profit tracking
             total_profit = Decimal(self.state.get("infinite_grid_profit", "0"))
