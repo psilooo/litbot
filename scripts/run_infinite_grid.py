@@ -114,6 +114,9 @@ class InfiniteGridBot:
                 await self.grid.check_fills()
                 await self.grid.check_and_recenter(current_price)
 
+                # Periodic reconciliation check (every 30 min)
+                await self.grid.maybe_reconcile()
+
                 if datetime.now().timestamp() - last_status_time >= status_interval:
                     await self._print_status(current_price)
                     last_status_time = datetime.now().timestamp()

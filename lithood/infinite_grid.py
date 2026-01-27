@@ -40,6 +40,9 @@ class InfiniteGridConfig:
 class InfiniteGridEngine:
     """Manages infinite grid trading with adaptive recentering."""
 
+    # Reconciliation interval in seconds (30 minutes)
+    RECONCILE_INTERVAL = 30 * 60
+
     def __init__(self, client: LighterClient, state: StateManager, config: InfiniteGridConfig = None):
         self.client = client
         self.state = state
@@ -51,6 +54,9 @@ class InfiniteGridEngine:
         self._grid_center: Decimal = Decimal("0")
         self._buy_levels: List[Decimal] = []
         self._sell_levels: List[Decimal] = []
+
+        # Reconciliation tracking
+        self._last_reconcile_time: Optional[datetime] = None
 
     async def initialize(self):
         """Initialize grid centered on current price."""
@@ -357,3 +363,121 @@ class InfiniteGridEngine:
             "recenters": int(self.state.get("infinite_grid_recenters", "0")),
             "paused": self.state.get("grid_paused", False),
         }
+
+    async def maybe_reconcile(self) -> bool:
+        """Run reconciliation if enough time has passed. Returns True if reconciliation ran."""
+        now = datetime.now()
+
+        # Skip if we reconciled recently
+        if self._last_reconcile_time is not None:
+            elapsed = (now - self._last_reconcile_time).total_seconds()
+            if elapsed < self.RECONCILE_INTERVAL:
+                return False
+
+        await self.reconcile_orders()
+        self._last_reconcile_time = now
+        return True
+
+    async def reconcile_orders(self):
+        """Reconcile local state with exchange - detect and fix order discrepancies.
+
+        Checks for:
+        1. Ghost orders: In local state as PENDING but not on exchange (may have filled undetected)
+        2. Orphan orders: On exchange but not in local state (shouldn't happen, but log if found)
+        3. Count mismatch: Total open orders doesn't match expected
+        """
+        log.info("=" * 50)
+        log.info("  ORDER RECONCILIATION CHECK")
+        log.info("=" * 50)
+
+        market = self.client.get_market(self.symbol, self.market_type)
+        if market is None:
+            log.error("Cannot reconcile: market not found")
+            return
+
+        try:
+            exchange_orders = await self.client.get_active_orders(market_id=market.market_id)
+        except Exception as e:
+            log.error(f"Cannot reconcile: failed to get exchange orders: {e}")
+            return
+
+        # Get local pending/partially filled orders
+        local_pending = self.state.get_pending_orders()
+        local_partial = self.state.get_orders_by_status(OrderStatus.PARTIALLY_FILLED)
+        local_orders = [o for o in local_pending + local_partial if o.market_id == market.market_id]
+
+        # Build lookup maps
+        exchange_by_id = {o.id: o for o in exchange_orders}
+        exchange_by_price_side = {(o.price, o.side): o for o in exchange_orders}
+        local_by_id = {o.id: o for o in local_orders}
+
+        # Count orders by side
+        exchange_buys = sum(1 for o in exchange_orders if o.side == OrderSide.BUY)
+        exchange_sells = sum(1 for o in exchange_orders if o.side == OrderSide.SELL)
+        local_buys = sum(1 for o in local_orders if o.side == OrderSide.BUY)
+        local_sells = sum(1 for o in local_orders if o.side == OrderSide.SELL)
+
+        log.info(f"  Exchange orders: {len(exchange_orders)} ({exchange_buys} buys, {exchange_sells} sells)")
+        log.info(f"  Local orders:    {len(local_orders)} ({local_buys} buys, {local_sells} sells)")
+
+        issues_found = 0
+        orders_fixed = 0
+
+        # Check for ghost orders (in local but not on exchange)
+        ghost_orders = []
+        for order in local_orders:
+            # Try ID match first, then price/side fallback
+            on_exchange = exchange_by_id.get(order.id)
+            if on_exchange is None:
+                on_exchange = exchange_by_price_side.get((order.price, order.side))
+
+            if on_exchange is None:
+                ghost_orders.append(order)
+
+        if ghost_orders:
+            issues_found += len(ghost_orders)
+            log.warning(f"  Found {len(ghost_orders)} GHOST orders (local but not on exchange):")
+            for order in ghost_orders:
+                log.warning(f"    - {order.side.value} @ ${order.price} (id={order.id})")
+                # These likely filled without detection - mark as filled and place counter
+                log.info(f"    -> Treating as filled, placing counter-order...")
+                try:
+                    await self._on_full_fill(order)
+                    orders_fixed += 1
+                except Exception as e:
+                    log.error(f"    -> Failed to process ghost order: {e}")
+
+        # Check for orphan orders (on exchange but not in local state)
+        orphan_orders = []
+        for order in exchange_orders:
+            in_local = local_by_id.get(order.id)
+            if in_local is None:
+                # Try price/side match as fallback
+                found = False
+                for local_order in local_orders:
+                    if local_order.price == order.price and local_order.side == order.side:
+                        found = True
+                        break
+                if not found:
+                    orphan_orders.append(order)
+
+        if orphan_orders:
+            issues_found += len(orphan_orders)
+            log.warning(f"  Found {len(orphan_orders)} ORPHAN orders (on exchange but not in local state):")
+            for order in orphan_orders:
+                log.warning(f"    - {order.side.value} @ ${order.price} (id={order.id})")
+                # Add to local state so we track it
+                log.info(f"    -> Adding to local state...")
+                try:
+                    self.state.save_order(order)
+                    orders_fixed += 1
+                except Exception as e:
+                    log.error(f"    -> Failed to save orphan order: {e}")
+
+        # Summary
+        if issues_found == 0:
+            log.info("  Status: OK - All orders accounted for")
+        else:
+            log.warning(f"  Status: {issues_found} issues found, {orders_fixed} fixed")
+
+        log.info("=" * 50)
