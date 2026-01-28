@@ -333,12 +333,16 @@ class InfiniteGridEngine:
                 await self._place_counter_order(order, new_fill_amount)
 
     async def _on_full_fill(self, order: Order):
-        """Handle full fill - mark filled and place counter-order."""
+        """Handle full fill - mark filled and place counter-order for remaining size."""
+        # Calculate remaining unfilled size (partial fills already handled)
+        remaining_size = order.size - order.filled_size
+
         # Mark the order as fully filled
         self.state.mark_filled(order.id, order.size)
 
-        # Place counter-order for the full size
-        await self._place_counter_order(order, order.size)
+        # Only place counter-order for the remaining unfilled portion
+        if remaining_size > 0:
+            await self._place_counter_order(order, remaining_size)
 
     async def _place_counter_order(self, order: Order, filled_size: Decimal, retry_count: int = 0):
         """Place counter-order for a fill. Retries on failure to prevent order loss."""
