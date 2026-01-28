@@ -59,6 +59,8 @@ class InfiniteGridEngine:
         self._last_reconcile_time: Optional[datetime] = None
 
         # Processing lock to prevent duplicate counter-orders from same partial fill
+        # Uses asyncio.Lock for atomic check-and-add operations
+        self._processing_lock = asyncio.Lock()
         self._processing_orders: set[str] = set()
 
     async def initialize(self) -> bool:
@@ -315,11 +317,12 @@ class InfiniteGridEngine:
             if order.created_at > grace_cutoff:
                 continue
 
-            # Skip if already being processed (prevents duplicate counter-orders)
-            if order.id in self._processing_orders:
-                continue
+            # Atomic check-and-add to prevent duplicate counter-orders
+            async with self._processing_lock:
+                if order.id in self._processing_orders:
+                    continue
+                self._processing_orders.add(order.id)
 
-            self._processing_orders.add(order.id)
             try:
                 # Try ID match first, fall back to price/side for backward compatibility
                 exchange_order = active_by_id.get(order.id)
@@ -341,7 +344,8 @@ class InfiniteGridEngine:
                     # Place counter-order for only the newly filled portion
                     await self._place_counter_order(order, new_fill_amount)
             finally:
-                self._processing_orders.discard(order.id)
+                async with self._processing_lock:
+                    self._processing_orders.discard(order.id)
 
     async def _on_full_fill(self, order: Order):
         """Handle full fill - mark filled and place counter-order for remaining size."""
