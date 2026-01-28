@@ -360,6 +360,23 @@ class InfiniteGridEngine:
 
             if counter_order is None:
                 if retry_count < max_retries:
+                    # Check if order already exists at this price (placement may have succeeded)
+                    market = self.client.get_market(self.symbol, self.market_type)
+                    if market is not None:
+                        try:
+                            active_orders = await self.client.get_active_orders(market_id=market.market_id)
+                            existing = [o for o in active_orders if o.price == sell_price and o.side == OrderSide.SELL]
+                            if existing:
+                                log.info(f"Order already exists at ${sell_price} SELL, skipping retry")
+                                counter_order = existing[0]
+                                # Save to local state if not already tracked
+                                self.state.save_order(counter_order)
+                                fills = int(self.state.get("infinite_grid_buy_fills", "0"))
+                                self.state.set("infinite_grid_buy_fills", str(fills + 1))
+                                return
+                        except Exception as e:
+                            log.warning(f"Failed to check for existing order: {e}")
+
                     log.warning(f"Counter-order failed, retrying ({retry_count + 1}/{max_retries})...")
                     await asyncio.sleep(2 ** retry_count)  # Exponential backoff
                     await self._place_counter_order(order, filled_size, retry_count + 1)
@@ -382,6 +399,29 @@ class InfiniteGridEngine:
 
             if counter_order is None:
                 if retry_count < max_retries:
+                    # Check if order already exists at this price (placement may have succeeded)
+                    market = self.client.get_market(self.symbol, self.market_type)
+                    if market is not None:
+                        try:
+                            active_orders = await self.client.get_active_orders(market_id=market.market_id)
+                            existing = [o for o in active_orders if o.price == buy_price and o.side == OrderSide.BUY]
+                            if existing:
+                                log.info(f"Order already exists at ${buy_price} BUY, skipping retry")
+                                counter_order = existing[0]
+                                # Save to local state if not already tracked
+                                self.state.save_order(counter_order)
+                                # Update profit tracking
+                                total_profit = Decimal(self.state.get("infinite_grid_profit", "0"))
+                                total_profit += profit
+                                self.state.set("infinite_grid_profit", str(total_profit))
+                                fills = int(self.state.get("infinite_grid_sell_fills", "0"))
+                                self.state.set("infinite_grid_sell_fills", str(fills + 1))
+                                cycles = int(self.state.get("infinite_grid_cycles", "0"))
+                                self.state.set("infinite_grid_cycles", str(cycles + 1))
+                                return
+                        except Exception as e:
+                            log.warning(f"Failed to check for existing order: {e}")
+
                     log.warning(f"Counter-order failed, retrying ({retry_count + 1}/{max_retries})...")
                     await asyncio.sleep(2 ** retry_count)  # Exponential backoff
                     await self._place_counter_order(order, filled_size, retry_count + 1)
