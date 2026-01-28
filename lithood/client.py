@@ -143,8 +143,8 @@ class LighterClient:
         if self.api_key_private and self.account_index is not None:
             # Pre-configure proxy before SignerClient init (SDK makes requests during __init__)
             if PROXY_URL:
-                from lighter.api_client import Configuration
-                Configuration.get_default_copy().proxy = PROXY_URL
+                from lighter.api_client import Configuration as LighterConfiguration
+                LighterConfiguration.get_default_copy().proxy = PROXY_URL
             self.signer_client = SignerClient(
                 url=self.base_url,
                 account_index=self.account_index,
