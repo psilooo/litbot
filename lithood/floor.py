@@ -112,9 +112,10 @@ class FloorProtection:
         if self.hedge and self.state.get("hedge_active"):
             await self.hedge.close_short(reason="emergency")
 
-        # Cancel all orders
+        # Cancel all orders - best effort in emergency, continue regardless
         if self.grid:
-            await self.grid.cancel_all()
+            if not await self.grid.cancel_all():
+                log.warning("Grid cancel_all failed during emergency exit - continuing with emergency procedures")
         await self.client.cancel_all_orders()
 
         # Get actual LIT balance from exchange and sell all

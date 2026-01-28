@@ -67,7 +67,9 @@ class InfiniteGridBot:
         self.grid = InfiniteGridEngine(self.client, self.state, config)
 
         await self._sync_state()
-        await self.grid.initialize()
+        if not await self.grid.initialize():
+            log.error("Failed to initialize grid - aborting bot start")
+            raise RuntimeError("Grid initialization failed")
 
         log.info("Infinite Grid Bot initialized. Starting main loop...")
         self._running = True
@@ -112,7 +114,8 @@ class InfiniteGridBot:
 
                 # Core loop
                 await self.grid.check_fills()
-                await self.grid.check_and_recenter(current_price)
+                if not await self.grid.check_and_recenter(current_price):
+                    log.warning("Recenter failed - will retry on next iteration")
 
                 # Periodic reconciliation check (every 30 min)
                 await self.grid.maybe_reconcile()

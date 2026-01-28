@@ -58,19 +58,25 @@ class InfiniteGridEngine:
         # Reconciliation tracking
         self._last_reconcile_time: Optional[datetime] = None
 
-    async def initialize(self):
-        """Initialize grid centered on current price."""
+    async def initialize(self) -> bool:
+        """Initialize grid centered on current price.
+
+        Returns:
+            True if initialization successful, False otherwise
+        """
         entry_price = await self.client.get_mid_price(self.symbol, self.market_type)
         if entry_price is None:
             log.error("Failed to get mid price - cannot initialize infinite grid")
-            return
+            return False
 
-        # Clear stale orders
-        await self._clear_all_grid_orders()
+        # Clear stale orders - abort if cancellation fails
+        if not await self._clear_all_grid_orders():
+            log.error("Failed to clear existing orders - aborting initialization to prevent order accumulation")
+            return False
 
         if self.state.get("grid_paused"):
             log.warning("Grid is paused - skipping initialization")
-            return
+            return True  # Not an error, just skipped
 
         self._grid_center = entry_price
 
@@ -84,6 +90,7 @@ class InfiniteGridEngine:
 
         self.state.set("infinite_grid_center", str(entry_price))
         log.info("Infinite grid initialized")
+        return True
 
     def _generate_levels(self, center: Decimal):
         """Generate buy and sell price levels around center."""
@@ -112,22 +119,123 @@ class InfiniteGridEngine:
         for price in self._sell_levels:
             await self._place_grid_sell(price)
 
-    async def _clear_all_grid_orders(self):
-        """Cancel all orders on the exchange."""
+    async def _clear_all_grid_orders(self, max_retries: int = 3, verify_delay: float = 1.0) -> bool:
+        """Cancel all orders on the exchange and verify cancellation.
+
+        Returns True only if all orders are confirmed cancelled on exchange.
+        Local state is only updated for orders confirmed to be gone.
+
+        Args:
+            max_retries: Maximum number of cancellation attempts
+            verify_delay: Seconds to wait between cancel and verify
+
+        Returns:
+            True if all orders successfully cancelled and verified, False otherwise
+        """
         market = self.client.get_market(self.symbol, self.market_type)
         if market is None:
-            return
-        try:
-            cancelled = await self.client.cancel_all_orders(market_id=market.market_id)
-            if cancelled > 0:
-                log.info(f"Cancelled {cancelled} orders during grid initialization")
-        except Exception as e:
-            log.warning(f"Failed to cancel orders: {e}")
+            log.error("Cannot clear orders: market not found")
+            return False
 
-        # Clear local state
-        for order in self.state.get_pending_orders():
-            if order.market_id == market.market_id:
-                self.state.mark_cancelled(order.id)
+        # Get local pending orders for this market before cancellation
+        local_pending = [
+            o for o in self.state.get_pending_orders()
+            if o.market_id == market.market_id
+        ]
+        local_partial = [
+            o for o in self.state.get_orders_by_status(OrderStatus.PARTIALLY_FILLED)
+            if o.market_id == market.market_id
+        ]
+        local_orders = local_pending + local_partial
+
+        if not local_orders:
+            # No local orders to cancel, but check exchange for orphans
+            try:
+                exchange_orders = await self.client.get_active_orders(market_id=market.market_id)
+                if exchange_orders:
+                    log.warning(f"Found {len(exchange_orders)} orphan orders on exchange with no local state")
+                    # Attempt to cancel orphans
+                    await self.client.cancel_all_orders(market_id=market.market_id)
+                    await asyncio.sleep(verify_delay)
+                    remaining = await self.client.get_active_orders(market_id=market.market_id)
+                    if remaining:
+                        log.error(f"Failed to cancel {len(remaining)} orphan orders")
+                        return False
+                    log.info("Successfully cancelled orphan orders")
+            except Exception as e:
+                log.warning(f"Error checking for orphan orders: {e}")
+            return True
+
+        log.info(f"Attempting to cancel {len(local_orders)} orders")
+
+        for attempt in range(max_retries):
+            try:
+                # Send cancellation request
+                cancelled = await self.client.cancel_all_orders(market_id=market.market_id)
+                log.info(f"Cancel request sent (attempt {attempt + 1}/{max_retries}), reported {cancelled} cancelled")
+
+                # Wait for cancellation to process
+                await asyncio.sleep(verify_delay)
+
+                # Verify by checking what's actually on the exchange
+                exchange_orders = await self.client.get_active_orders(market_id=market.market_id)
+                exchange_ids = {o.id for o in exchange_orders}
+
+                # Check which local orders are confirmed gone
+                confirmed_cancelled = []
+                still_active = []
+
+                for order in local_orders:
+                    if order.id not in exchange_ids:
+                        confirmed_cancelled.append(order)
+                    else:
+                        still_active.append(order)
+
+                # Mark confirmed cancelled orders in local state
+                for order in confirmed_cancelled:
+                    try:
+                        self.state.mark_cancelled(order.id)
+                    except Exception as e:
+                        log.warning(f"Failed to mark order {order.id} as cancelled in local state: {e}")
+
+                if confirmed_cancelled:
+                    log.info(f"Verified {len(confirmed_cancelled)} orders cancelled")
+
+                if not still_active:
+                    # All orders confirmed cancelled
+                    log.info("All orders successfully cancelled and verified")
+                    return True
+
+                # Some orders still active - will retry
+                log.warning(
+                    f"Cancellation incomplete: {len(still_active)} orders still active on exchange "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                for order in still_active[:5]:  # Log first 5
+                    log.warning(f"  Still active: {order.side.value} @ ${order.price} (id={order.id})")
+
+                # Update local_orders to only track still-active ones for next iteration
+                local_orders = still_active
+
+            except Exception as e:
+                log.error(f"Cancellation attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    log.error("All cancellation attempts failed - local state preserved")
+                    return False
+
+            # Exponential backoff before retry
+            if attempt < max_retries - 1:
+                backoff = verify_delay * (2 ** attempt)
+                log.info(f"Retrying in {backoff:.1f}s...")
+                await asyncio.sleep(backoff)
+
+        # If we get here, we've exhausted retries with orders still active
+        log.error(
+            f"Failed to cancel all orders after {max_retries} attempts. "
+            f"{len(local_orders)} orders may still be active on exchange. "
+            "Local state preserved for unverified orders."
+        )
+        return False
 
     async def _place_grid_buy(self, price: Decimal) -> Optional[Order]:
         """Place a grid buy order."""
@@ -290,37 +398,56 @@ class InfiniteGridEngine:
             cycles = int(self.state.get("infinite_grid_cycles", "0"))
             self.state.set("infinite_grid_cycles", str(cycles + 1))
 
-    async def check_and_recenter(self, current_price: Decimal):
-        """Check if price has reached grid edge and recenter if needed."""
+    async def check_and_recenter(self, current_price: Decimal) -> bool:
+        """Check if price has reached grid edge and recenter if needed.
+
+        Args:
+            current_price: Current market price
+
+        Returns:
+            True if no recenter needed or recenter successful, False if recenter failed
+        """
         if not self._buy_levels or not self._sell_levels:
-            return
+            return True
 
         threshold = self.config.recenter_threshold
 
         # Ensure threshold doesn't exceed list length
         if threshold <= 0:
-            return
+            return True
         sell_threshold = min(threshold, len(self._sell_levels))
         buy_threshold = min(threshold, len(self._buy_levels))
 
         # Near top? (price approaching highest sell)
         if current_price >= self._sell_levels[-sell_threshold]:
             log.info(f"Price ${current_price} near top of grid - recentering")
-            await self._recenter(current_price)
-            return
+            return await self._recenter(current_price)
 
         # Near bottom? (price approaching lowest buy)
         if current_price <= self._buy_levels[-buy_threshold]:
             log.info(f"Price ${current_price} near bottom of grid - recentering")
-            await self._recenter(current_price)
-            return
+            return await self._recenter(current_price)
 
-    async def _recenter(self, new_center: Decimal):
-        """Cancel all orders and rebuild grid around new center."""
+        return True
+
+    async def _recenter(self, new_center: Decimal) -> bool:
+        """Cancel all orders and rebuild grid around new center.
+
+        Args:
+            new_center: New center price for the grid
+
+        Returns:
+            True if recenter successful, False otherwise
+        """
         log.info(f"RECENTERING grid from ${self._grid_center} to ${new_center}")
 
-        # Cancel all existing orders
-        await self._clear_all_grid_orders()
+        # Cancel all existing orders - abort if cancellation fails
+        if not await self._clear_all_grid_orders():
+            log.error(
+                f"Failed to clear orders during recenter - aborting to prevent order accumulation. "
+                f"Grid center remains at ${self._grid_center}"
+            )
+            return False
 
         # Update center
         self._grid_center = new_center
@@ -336,6 +463,7 @@ class InfiniteGridEngine:
         self.state.set("infinite_grid_recenters", str(recenters + 1))
 
         log.info(f"Grid recentered. New center: ${new_center}")
+        return True
 
     def pause(self):
         """Pause grid trading."""
@@ -347,10 +475,13 @@ class InfiniteGridEngine:
         self.state.set("grid_paused", False)
         log.info("Infinite grid RESUMED")
 
-    async def cancel_all(self) -> int:
-        """Cancel all grid orders."""
-        await self._clear_all_grid_orders()
-        return 0  # Count handled in _clear_all_grid_orders
+    async def cancel_all(self) -> bool:
+        """Cancel all grid orders.
+
+        Returns:
+            True if all orders successfully cancelled, False otherwise
+        """
+        return await self._clear_all_grid_orders()
 
     def get_stats(self) -> dict:
         """Get grid statistics."""
