@@ -572,8 +572,24 @@ class InfiniteGridEngine:
         if ghost_orders:
             issues_found += len(ghost_orders)
             log.warning(f"  Found {len(ghost_orders)} GHOST orders (local but not on exchange):")
+
+            # Grace period to avoid processing orders that check_fills already handled
+            # or orders that were just placed and haven't synced yet
+            grace_cutoff = datetime.now() - timedelta(seconds=30)
+
             for order in ghost_orders:
                 log.warning(f"    - {order.side.value} @ ${order.price} (id={order.id})")
+
+                # Skip if already processed by check_fills (marked FILLED)
+                if order.status == OrderStatus.FILLED:
+                    log.info(f"    -> Already marked FILLED, skipping")
+                    continue
+
+                # Skip recently created orders (may not have synced yet)
+                if order.created_at > grace_cutoff:
+                    log.info(f"    -> Order too recent, skipping")
+                    continue
+
                 # These likely filled without detection - mark as filled and place counter
                 log.info(f"    -> Treating as filled, placing counter-order...")
                 try:
