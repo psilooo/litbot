@@ -247,6 +247,19 @@ class InfiniteGridEngine:
         if self.state.get("grid_paused"):
             return None
 
+        # Check if order already exists at this price to prevent duplicates
+        market = self.client.get_market(self.symbol, self.market_type)
+        if market is not None:
+            try:
+                active_orders = await self.client.get_active_orders(market_id=market.market_id)
+                existing = [o for o in active_orders if o.price == price and o.side == OrderSide.BUY]
+                if existing:
+                    log.info(f"BUY order already exists at ${price}, skipping placement")
+                    # Return existing order so caller knows placement "succeeded"
+                    return existing[0]
+            except Exception as e:
+                log.warning(f"Failed to check for existing buy order at ${price}: {e}")
+
         order = await self.client.place_limit_order(
             symbol=self.symbol,
             market_type=self.market_type,
@@ -266,6 +279,19 @@ class InfiniteGridEngine:
         """Place a grid sell order."""
         if self.state.get("grid_paused"):
             return None
+
+        # Check if order already exists at this price to prevent duplicates
+        market = self.client.get_market(self.symbol, self.market_type)
+        if market is not None:
+            try:
+                active_orders = await self.client.get_active_orders(market_id=market.market_id)
+                existing = [o for o in active_orders if o.price == price and o.side == OrderSide.SELL]
+                if existing:
+                    log.info(f"SELL order already exists at ${price}, skipping placement")
+                    # Return existing order so caller knows placement "succeeded"
+                    return existing[0]
+            except Exception as e:
+                log.warning(f"Failed to check for existing sell order at ${price}: {e}")
 
         order = await self.client.place_limit_order(
             symbol=self.symbol,
