@@ -58,6 +58,9 @@ class InfiniteGridEngine:
         # Reconciliation tracking
         self._last_reconcile_time: Optional[datetime] = None
 
+        # Processing lock to prevent duplicate counter-orders from same partial fill
+        self._processing_orders: set[str] = set()
+
     async def initialize(self) -> bool:
         """Initialize grid centered on current price.
 
@@ -312,25 +315,33 @@ class InfiniteGridEngine:
             if order.created_at > grace_cutoff:
                 continue
 
-            # Try ID match first, fall back to price/side for backward compatibility
-            exchange_order = active_by_id.get(order.id)
-            if exchange_order is None:
-                exchange_order = active_by_price_side.get((order.price, order.side))
+            # Skip if already being processed (prevents duplicate counter-orders)
+            if order.id in self._processing_orders:
+                continue
 
-            if exchange_order is None:
-                # Order is no longer active - fully filled
-                await self._on_full_fill(order)
-            elif exchange_order.filled_size > order.filled_size:
-                # Order is still active but has new partial fill
-                new_fill_amount = exchange_order.filled_size - order.filled_size
-                log.info(
-                    f"Partial fill detected: {new_fill_amount:.4f} of {order.size:.4f} "
-                    f"@ ${order.price} ({order.side.value})"
-                )
-                # Update local state with new filled amount (keep as PARTIALLY_FILLED)
-                self.state.mark_partially_filled(order.id, exchange_order.filled_size)
-                # Place counter-order for only the newly filled portion
-                await self._place_counter_order(order, new_fill_amount)
+            self._processing_orders.add(order.id)
+            try:
+                # Try ID match first, fall back to price/side for backward compatibility
+                exchange_order = active_by_id.get(order.id)
+                if exchange_order is None:
+                    exchange_order = active_by_price_side.get((order.price, order.side))
+
+                if exchange_order is None:
+                    # Order is no longer active - fully filled
+                    await self._on_full_fill(order)
+                elif exchange_order.filled_size > order.filled_size:
+                    # Order is still active but has new partial fill
+                    new_fill_amount = exchange_order.filled_size - order.filled_size
+                    log.info(
+                        f"Partial fill detected: {new_fill_amount:.4f} of {order.size:.4f} "
+                        f"@ ${order.price} ({order.side.value})"
+                    )
+                    # Update local state with new filled amount (keep as PARTIALLY_FILLED)
+                    self.state.mark_partially_filled(order.id, exchange_order.filled_size)
+                    # Place counter-order for only the newly filled portion
+                    await self._place_counter_order(order, new_fill_amount)
+            finally:
+                self._processing_orders.discard(order.id)
 
     async def _on_full_fill(self, order: Order):
         """Handle full fill - mark filled and place counter-order for remaining size."""
