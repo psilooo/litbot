@@ -9,15 +9,7 @@ from typing import Optional
 
 from eth_account import Account as EthAccount
 
-from lighter import (
-    Configuration,
-    ApiClient,
-    SignerClient,
-    AccountApi,
-    OrderApi,
-    FundingApi,
-)
-
+# IMPORTANT: Import config FIRST to set proxy env vars before lighter/requests loads
 from lithood.config import (
     LIGHTER_BASE_URL,
     LIGHTER_PRIVATE_KEY,
@@ -25,6 +17,15 @@ from lithood.config import (
     LIGHTER_API_KEY_INDEX,
     LIGHTER_ACCOUNT_INDEX,
     PROXY_URL,
+)
+
+from lighter import (
+    Configuration,
+    ApiClient,
+    SignerClient,
+    AccountApi,
+    OrderApi,
+    FundingApi,
 )
 from lithood.logger import log
 from lithood.types import (
@@ -140,12 +141,16 @@ class LighterClient:
 
         # Initialize signer client for write operations (using API key)
         if self.api_key_private and self.account_index is not None:
+            # Pre-configure proxy before SignerClient init (SDK makes requests during __init__)
+            if PROXY_URL:
+                from lighter.api_client import Configuration
+                Configuration.get_default_copy().proxy = PROXY_URL
             self.signer_client = SignerClient(
                 url=self.base_url,
                 account_index=self.account_index,
                 api_private_keys={self.api_key_index: self.api_key_private},
             )
-            # Apply proxy to signer client's internal api_client
+            # Also apply proxy to the instance's api_client
             if PROXY_URL:
                 self.signer_client.api_client.configuration.proxy = PROXY_URL
                 log.info(f"Signer client proxy configured")
@@ -182,6 +187,10 @@ class LighterClient:
         self.funding_api = FundingApi(self.api_client)
 
         if self.api_key_private and self.account_index is not None:
+            # Pre-configure proxy before SignerClient init
+            if PROXY_URL:
+                from lighter.api_client import Configuration as LighterConfig
+                LighterConfig.get_default_copy().proxy = PROXY_URL
             self.signer_client = SignerClient(
                 url=self.base_url,
                 account_index=self.account_index,
