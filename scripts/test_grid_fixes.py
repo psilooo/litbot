@@ -388,11 +388,17 @@ async def test_full_cycle(tester: GridFixTester) -> bool:
     # Simulate several operation cycles
     log.info("Running 3 operation cycles...")
     current_price = await tester.client.get_mid_price(SPOT_SYMBOL, MarketType.SPOT)
+    log.info(f"Current price: ${current_price}")
+    log.info(f"Buy levels: {tester.grid._buy_levels}")
+    log.info(f"Sell levels: {tester.grid._sell_levels}")
 
     for i in range(3):
-        log.info(f"Cycle {i+1}/3...")
+        count_before = len(await tester.client.get_active_orders(market_id=tester.market.market_id))
+        log.info(f"Cycle {i+1}/3 (orders before: {count_before})...")
         await tester.grid.check_fills()
         await tester.grid.check_and_recenter(current_price)
+        count_after = len(await tester.client.get_active_orders(market_id=tester.market.market_id))
+        log.info(f"Cycle {i+1}/3 done (orders after: {count_after})")
         await asyncio.sleep(1)
 
     mid_count = len(await tester.client.get_active_orders(market_id=tester.market.market_id))

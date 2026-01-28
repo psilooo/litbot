@@ -184,43 +184,22 @@ class InfiniteGridEngine:
 
                 # Verify by checking what's actually on the exchange
                 exchange_orders = await self.client.get_active_orders(market_id=market.market_id)
-                exchange_ids = {o.id for o in exchange_orders}
 
-                # Check which local orders are confirmed gone
-                confirmed_cancelled = []
-                still_active = []
-
-                for order in local_orders:
-                    if order.id not in exchange_ids:
-                        confirmed_cancelled.append(order)
-                    else:
-                        still_active.append(order)
-
-                # Mark confirmed cancelled orders in local state
-                for order in confirmed_cancelled:
-                    try:
-                        self.state.mark_cancelled(order.id)
-                    except Exception as e:
-                        log.warning(f"Failed to mark order {order.id} as cancelled in local state: {e}")
-
-                if confirmed_cancelled:
-                    log.info(f"Verified {len(confirmed_cancelled)} orders cancelled")
-
-                if not still_active:
-                    # All orders confirmed cancelled
+                if len(exchange_orders) == 0:
+                    # All orders confirmed cancelled - clear local state
+                    for order in local_orders:
+                        try:
+                            self.state.mark_cancelled(order.id)
+                        except Exception as e:
+                            log.warning(f"Failed to mark order {order.id} as cancelled: {e}")
                     log.info("All orders successfully cancelled and verified")
                     return True
 
                 # Some orders still active - will retry
                 log.warning(
-                    f"Cancellation incomplete: {len(still_active)} orders still active on exchange "
+                    f"Cancellation incomplete: {len(exchange_orders)} orders still on exchange "
                     f"(attempt {attempt + 1}/{max_retries})"
                 )
-                for order in still_active[:5]:  # Log first 5
-                    log.warning(f"  Still active: {order.side.value} @ ${order.price} (id={order.id})")
-
-                # Update local_orders to only track still-active ones for next iteration
-                local_orders = still_active
 
             except Exception as e:
                 log.error(f"Cancellation attempt {attempt + 1} failed: {e}")
@@ -252,10 +231,12 @@ class InfiniteGridEngine:
         if market is not None:
             try:
                 active_orders = await self.client.get_active_orders(market_id=market.market_id)
-                existing = [o for o in active_orders if o.price == price and o.side == OrderSide.BUY]
+                # Quantize prices for comparison to handle precision differences
+                target_price = price.quantize(Decimal("0.0001"))
+                existing = [o for o in active_orders
+                           if o.price.quantize(Decimal("0.0001")) == target_price and o.side == OrderSide.BUY]
                 if existing:
                     log.info(f"BUY order already exists at ${price}, skipping placement")
-                    # Return existing order so caller knows placement "succeeded"
                     return existing[0]
             except Exception as e:
                 log.warning(f"Failed to check for existing buy order at ${price}: {e}")
@@ -285,10 +266,12 @@ class InfiniteGridEngine:
         if market is not None:
             try:
                 active_orders = await self.client.get_active_orders(market_id=market.market_id)
-                existing = [o for o in active_orders if o.price == price and o.side == OrderSide.SELL]
+                # Quantize prices for comparison to handle precision differences
+                target_price = price.quantize(Decimal("0.0001"))
+                existing = [o for o in active_orders
+                           if o.price.quantize(Decimal("0.0001")) == target_price and o.side == OrderSide.SELL]
                 if existing:
                     log.info(f"SELL order already exists at ${price}, skipping placement")
-                    # Return existing order so caller knows placement "succeeded"
                     return existing[0]
             except Exception as e:
                 log.warning(f"Failed to check for existing sell order at ${price}: {e}")
